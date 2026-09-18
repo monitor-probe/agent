@@ -24,6 +24,7 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
+    ifaces: collect::Ifaces,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
@@ -37,8 +38,12 @@ fn usage() -> ! {
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
            --token <token>      Node token from the hub panel\n  \
            --interval <secs>    Report interval (default 1)\n  \
-           --insecure           Allow plain ws:// to a remote hub; the token\n  \
-                                travels in the clear. Only for a hub reached\n  \
+           --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
+                                eth1,pppoe-wan. `-name` removes an interface\n                       \
+                                from what would be counted; a trailing *\n                       \
+                                matches a prefix.\n  \
+           --insecure           Allow plain ws:// to a remote hub; the token\n                       \
+                                travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",
         env!("CARGO_PKG_VERSION")
     );
@@ -46,7 +51,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
+    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -54,6 +59,7 @@ fn parse_args() -> Result<Args> {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
+            "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -61,7 +67,9 @@ fn parse_args() -> Result<Args> {
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure })
+    let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
+    let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -178,7 +186,15 @@ async fn main() -> Result<()> {
     for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
-    let mut collector = Collector::new();
+    let mut collector = Collector::new(args.ifaces);
+    // Reported once at startup: an interface summed twice otherwise shows only
+    // as a total twice the real one. One listed in --iface but absent here,
+    // such as a PPPoE link not yet dialled, is counted once it appears.
+    let counted = collector.counted_ifaces();
+    eprintln!(
+        "counting traffic on: {}",
+        if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
+    );
     let mut wait = 0u64;
 
     loop {

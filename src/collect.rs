@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::Path;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -13,13 +14,20 @@ use serde::Serialize;
 /// a second time inside their carrier.
 ///
 /// `tailscale` belongs to the tunnel group for the same reason `wg` does: it is
-/// WireGuard under another name, on an interface not called `wg0`.
+/// WireGuard under another name, on an interface not called `wg0`. `fwln` is
+/// the half of a Proxmox firewall's veth pair that `fwpr` does not match, and
+/// `ifb` mirrors another interface's ingress for traffic shaping.
 ///
-/// ponytail: a name list, so the next tunnel will be missed as well. The kernel
-/// knows the answer -- a real NIC has /sys/class/net/<name>/device, a virtual
-/// one does not -- but a card wrongly failing that test loses a node's entire
-/// traffic, where a missing name only doubles it. Worth the swap only after
-/// verification against every card in the fleet.
+/// `gretap` and `erspan` are GRE carrying Ethernet; the kernel creates one of
+/// each, idle, wherever the GRE module is loaded.
+///
+/// ponytail: a name list, so a GRE tap or a VPN's tap under a new name will be
+/// missed. No kernel attribute separates one from the veth that is an LXC
+/// guest's only link: both are Ethernet with no device and no DEVTYPE, and a
+/// guest counted as virtual would report no traffic at all. Other tunnels are
+/// recognised by [`counted_elsewhere`] whatever their name; the tunnel entries
+/// here also keep their addresses out of [`addresses`]. `--iface` covers
+/// whatever neither catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -35,6 +43,10 @@ const SKIP_IFACES: &[&str] = &[
     "podman",
     "fwbr",
     "fwpr",
+    "fwln",
+    "ifb",
+    "gretap",
+    "erspan",
     "kube",
     "cali",
     "nerdctl",
@@ -103,8 +115,13 @@ pub struct Facts {
 
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct Metrics {
-    /// Identifies this boot. It changes on reboot, which is how the hub knows
-    /// the kernel's byte counters restarted at zero.
+    /// Names the span over which `net_rx_total` and `net_tx_total` readings
+    /// are comparable. The hub only tests it for equality, and a change makes
+    /// it re-baseline rather than book the difference. It is the kernel's boot
+    /// id, which changes when the counters restart at zero, with `--iface`
+    /// appended when set, since a different set of interfaces sums different
+    /// counters: widening it within one boot would otherwise book the added
+    /// interfaces' lifetime bytes as traffic.
     pub boot_id: String,
     pub uptime: u64,
     pub cpu: f32,
@@ -126,15 +143,86 @@ pub struct Metrics {
     pub procs: u32,
 }
 
+/// The traffic filter set by `--iface`: interface names separated by commas,
+/// each matching a prefix when it ends in `*`.
+///
+/// A plain entry makes the list the whole answer: listed interfaces are counted
+/// and nothing else is, whatever the built-in rules say. Only the machine's
+/// owner knows which port faces the provider on a router, where a forwarded
+/// byte crosses two real NICs, or whether a Proxmox host's `vmbr0` alone should
+/// count. An entry starting with `-` removes its matches from what is counted
+/// otherwise, which one command can apply across machines whose NICs are named
+/// differently. Exclusions win over inclusions.
+#[derive(Default)]
+pub struct Ifaces {
+    spec: String,
+    only: Vec<String>,
+    skip: Vec<String>,
+}
+
+impl Ifaces {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let entries: Vec<&str> = spec.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+        let mut ifaces = Self { spec: entries.join(","), ..Self::default() };
+        for entry in entries {
+            let (list, name) = match entry.strip_prefix('-') {
+                Some(name) => (&mut ifaces.skip, name),
+                None => (&mut ifaces.only, entry),
+            };
+            // Rejected rather than left to match nothing: either mistake would
+            // silently remove interfaces from the totals.
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                return Err(format!(
+                    "--iface: {entry:?} is not an interface name; separate names with commas"
+                ));
+            }
+            if name.find('*').is_some_and(|i| i + 1 < name.len()) {
+                return Err(format!("--iface: {entry:?}: `*` may only end a name"));
+            }
+            list.push(name.to_owned());
+        }
+        Ok(ifaces)
+    }
+
+    fn counts(&self, sys: &Path, name: &str) -> bool {
+        let matches = |p: &String| p.strip_suffix('*').map_or(name == p, |prefix| name.starts_with(prefix));
+        if self.skip.iter().any(matches) {
+            return false;
+        }
+        if !self.only.is_empty() {
+            return self.only.iter().any(matches);
+        }
+        !skip_iface(name) && !is_stacked(name) && !counted_elsewhere(sys, name)
+    }
+
+    /// See [`Metrics::boot_id`].
+    fn epoch(&self, boot_id: String) -> String {
+        if self.spec.is_empty() {
+            boot_id
+        } else {
+            format!("{boot_id}/{}", self.spec)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Collector {
+    ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
 }
 
 impl Collector {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ifaces: Ifaces) -> Self {
+        Self { ifaces, ..Self::default() }
+    }
+
+    /// The interfaces the traffic totals include at this moment.
+    pub fn counted_ifaces(&self) -> Vec<String> {
+        net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
+            .filter(|(name, ..)| self.ifaces.counts(Path::new(SYS_NET), name))
+            .map(|(name, ..)| name.to_owned())
+            .collect()
     }
 
     pub fn facts(&self) -> Facts {
@@ -164,12 +252,15 @@ impl Collector {
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
         let (disk_total, disk_used) = disk_usage(&real_mount_points());
-        let (rx_total, tx_total) = net_totals();
+        let (rx_total, tx_total) =
+            parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default(), |name| {
+                self.ifaces.counts(Path::new(SYS_NET), name)
+            });
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id: read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+            boot_id: self.ifaces.epoch(read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default()),
             uptime: uptime(),
             cpu: self.cpu_percent(),
             load: loadavg(),
@@ -390,43 +481,88 @@ pub fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// Sums the kernel's lifetime byte counters, one count per byte on the wire.
-fn net_totals() -> (u64, u64) {
-    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
+/// Sums the kernel's lifetime byte counters over the interfaces `counts`
+/// accepts, one count per byte on the wire.
+fn parse_net_dev(text: &str, counts: impl Fn(&str) -> bool) -> (u64, u64) {
+    net_dev(text)
+        .filter(|(name, ..)| counts(name))
+        .fold((0, 0), |(rx, tx), (_, r, t)| (rx.saturating_add(r), tx.saturating_add(t)))
 }
 
-fn parse_net_dev(text: &str) -> (u64, u64) {
-    let mut rx = 0u64;
-    let mut tx = 0u64;
-    for line in text.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else { continue };
-        let name = name.trim();
-        if skip_iface(name) || is_stacked(name) {
-            continue;
-        }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-        if f.len() >= 9 {
-            rx = rx.saturating_add(f[0]);
-            tx = tx.saturating_add(f[8]);
-        }
-    }
-    (rx, tx)
+/// `(name, rx bytes, tx bytes)` for each interface in /proc/net/dev.
+fn net_dev(text: &str) -> impl Iterator<Item = (&str, u64, u64)> {
+    text.lines().skip(2).filter_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        let mut f = rest.split_whitespace().map(|v| v.parse::<u64>().ok());
+        let rx = f.next()??;
+        let tx = f.nth(7)??;
+        Some((name.trim(), rx, tx))
+    })
 }
 
 fn skip_iface(name: &str) -> bool {
     SKIP_IFACES.iter().any(|p| name.starts_with(p))
 }
 
-/// Stacked on top of another interface: bonds, bridges, VLAN children. The
-/// kernel books one packet on both, so counting these would double the traffic
-/// the hub bills.
+/// Stacked on top of another interface: bonds, bridges, VLAN children, and
+/// OpenWrt's `pppoe-wan` over its WAN port. The kernel books one packet on
+/// both, so counting these would double the traffic the hub bills. `pppoe-`
+/// names PPPoE alone: a bare `ppp0` may be an LTE modem's only link.
+///
+/// [`counted_elsewhere`] finds the same from the kernel's links under any name.
+/// The names still hold where sysfs cannot be read, and PPPoE has no such link
+/// to the port it runs over.
 ///
 /// A traffic rule only. These interfaces are where a host's own address most
-/// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link --
-/// and whether bytes were already counted says nothing about address
-/// ownership.
+/// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link,
+/// `pppoe-wan` on a router -- and whether bytes were already counted says
+/// nothing about address ownership.
 fn is_stacked(name: &str) -> bool {
-    name.contains('.') || ["bond", "br", "vlan", "vmbr"].iter().any(|p| name.starts_with(p))
+    name.contains('.') || ["bond", "br", "vlan", "vmbr", "pppoe-"].iter().any(|p| name.starts_with(p))
+}
+
+const SYS_NET: &str = "/sys/class/net";
+
+/// Link types of layer-3 tunnels as /sys/class/net/<name>/type prints them:
+/// none (tun, WireGuard, Tailscale), ipip, ip6tnl, sit, gre, ip6gre. Read off
+/// devices of each kind created on a 6.1 kernel. OpenVZ's `venet0`, a
+/// container's only link, is void (65535) and stays out.
+const TUNNEL_TYPES: &[&str] = &["65534", "768", "769", "776", "778", "823"];
+
+/// Layer-2 tunnels that name themselves in `uevent`. GRE taps set no DEVTYPE
+/// and are left to [`SKIP_IFACES`].
+const TUNNEL_DEVTYPES: &[&str] = &["DEVTYPE=vxlan", "DEVTYPE=geneve"];
+
+/// Whether the kernel shows this interface's bytes counted on another one,
+/// whatever it is called:
+///
+/// - a `lower_*` link names a device beneath it in this namespace: a bridge
+///   with ports, a bond, a VLAN, a macvlan, a DSA switch port over its conduit.
+///   The link is absent once a device moves to another namespace, so a
+///   container whose only link is a macvlan still counts it.
+/// - no hardware behind it, and a tunnel's link type or DEVTYPE: `he-ipv6`, a
+///   mesh VPN or `cilium_vxlan` is caught as surely as `wg0`, since its payload
+///   leaves again inside a packet the carrier counts. Hardware exempts an LTE
+///   modem in raw-IP mode, which shares type none with WireGuard.
+///
+/// A traffic rule only, like [`is_stacked`]: a tunnel broker's prefix on
+/// `he-ipv6` is this machine's address. Unreadable sysfs leaves the name rules
+/// alone in force.
+fn counted_elsewhere(sys: &Path, name: &str) -> bool {
+    let dev = sys.join(name);
+    // Before the hardware test: a DSA switch port has both.
+    let stacked = fs::read_dir(&dev).is_ok_and(|mut entries| {
+        entries.any(|e| e.is_ok_and(|e| e.file_name().as_encoded_bytes().starts_with(b"lower_")))
+    });
+    if stacked {
+        return true;
+    }
+    if dev.join("device").exists() {
+        return false;
+    }
+    let read = |f: &str| fs::read_to_string(dev.join(f)).unwrap_or_default();
+    TUNNEL_TYPES.contains(&read("type").trim())
+        || read("uevent").lines().any(|l| TUNNEL_DEVTYPES.contains(&l))
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one such as
@@ -676,7 +812,7 @@ mod tests {
         // A counter that moved backwards indicates a reboot, not 100% busy.
         assert_eq!(busy_percent((1000, 925), (500, 400)), 0.0);
         // The first call has no baseline, so it reports 0.
-        assert_eq!(Collector::new().cpu_percent(), 0.0);
+        assert_eq!(Collector::default().cpu_percent(), 0.0);
     }
 
     #[test]
@@ -690,8 +826,10 @@ mod tests {
     }
 
     /// One byte on the wire, counted once. Every line but eth0 is that same
-    /// byte booked a second time: bond, bridge and VLAN are stacked over it,
-    /// and a tunnel's payload leaves inside a packet eth0 has already counted.
+    /// byte booked a second time: bond, bridge, VLAN and PPPoE are stacked over
+    /// it, a tunnel's payload leaves inside a packet eth0 has already counted,
+    /// `fwln` carries a Proxmox guest's traffic on its way to eth0, and `ifb`
+    /// mirrors eth0's ingress.
     ///
     /// `tailscale0` is listed because it is the same tunnel as `wg0` under a
     /// different name.
@@ -706,12 +844,16 @@ mod tests {
            tailscale0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tun0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tap0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+            fwln100i0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+             ifb4eth0: 1000 1 0 0 0 0 0 0 1000 2 0 0 0 0 0 0\n\
                 bond0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
                   br0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
                 vmbr0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
              eth0.100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
-              vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(dev), (1000, 2000));
+              vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+            pppoe-wan: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        let ifaces = Ifaces::default();
+        assert_eq!(parse_net_dev(dev, |n| ifaces.counts(Path::new("/nonexistent"), n)), (1000, 2000));
     }
 
     /// The two questions asked of an interface name, and why one list cannot
@@ -719,16 +861,109 @@ mod tests {
     /// may be this machine's only address.
     #[test]
     fn a_stacked_device_loses_its_bytes_but_keeps_its_address() {
-        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100"] {
+        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100", "pppoe-wan"] {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
         // Neither this machine's traffic nor its address: container networks,
         // and tunnels whose payload leaves inside a packet eth0 has counted.
-        for name in ["lo", "docker0", "veth9a1b2c", "br-6cd9538131d7", "virbr0", "wg0", "tun0", "tap0"] {
+        for name in [
+            "lo",
+            "docker0",
+            "veth9a1b2c",
+            "br-6cd9538131d7",
+            "virbr0",
+            "wg0",
+            "tun0",
+            "tap0",
+            "fwln100i0",
+            "ifb4eth0",
+            "gretap0",
+            "erspan0",
+        ] {
             assert!(skip_iface(name), "{name} is not this machine");
         }
         assert!(!skip_iface("eth0") && !is_stacked("eth0"), "the wire itself is what gets counted");
+    }
+
+    /// The kernel's account of an interface decides, whatever it is called.
+    /// Each entry mirrors what /sys/class/net held for that kind on a 6.1
+    /// kernel: link type, the `device` link of hardware, the `lower_` link of a
+    /// stacked device, DEVTYPE in `uevent`. The exempt ones are links a machine
+    /// depends on that resemble a copy: a raw-IP LTE modem shares WireGuard's
+    /// type none, OpenVZ's venet0 has no device, and a macvlan moved into a
+    /// container loses its `lower_` link there.
+    #[test]
+    fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
+        let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
+        for (name, ty, extra) in [
+            ("he-ipv6", 776, &[][..]),
+            ("nebula1", 65534, &[]),
+            ("gre1", 778, &[]),
+            ("vx100", 1, &["DEVTYPE=vxlan"]),
+            ("lan", 1, &["lower_eth0"]),
+            ("wan", 1, &["device", "lower_eth0"]),
+            ("wwan0", 65534, &["device"]),
+            ("venet0", 65535, &[]),
+            ("mv0", 1, &[]),
+            ("eth0", 1, &["device"]),
+        ] {
+            let dir = sys.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("type"), format!("{ty}\n")).unwrap();
+            for e in extra {
+                match e.strip_prefix("DEVTYPE=") {
+                    Some(_) => fs::write(dir.join("uevent"), format!("{e}\nINTERFACE={name}\n")).unwrap(),
+                    None => fs::create_dir(dir.join(e)).unwrap(),
+                }
+            }
+        }
+        // Tunnels by link type and DEVTYPE; a user-named bridge and a DSA
+        // switch port by their link to the device beneath.
+        for name in ["he-ipv6", "nebula1", "gre1", "vx100", "lan", "wan"] {
+            assert!(counted_elsewhere(&sys, name), "{name}: another interface counts these bytes");
+        }
+        for name in ["wwan0", "venet0", "mv0", "eth0", "absent0"] {
+            assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
+        }
+        fs::remove_dir_all(&sys).unwrap();
+    }
+
+    /// A router forwards each byte across two real NICs, so only its owner can
+    /// name the one facing the provider. What `--iface` lists is counted and
+    /// nothing else, whatever the built-in rules say; `-` entries come off the
+    /// top of either.
+    #[test]
+    fn iface_names_what_is_counted_over_every_built_in_rule() {
+        // 1000 bytes downloaded through the router: in on the WAN port inside
+        // PPPoE, out through the LAN port.
+        let dev = "header\nheader\n\
+                   eth0: 50 1 0 0 0 0 0 0 1000 2 0 0 0 0 0 0\n\
+                   eth1: 1008 1 0 0 0 0 0 0 60 2 0 0 0 0 0 0\n\
+              pppoe-wan: 1000 1 0 0 0 0 0 0 52 2 0 0 0 0 0 0\n\
+                  vmbr0: 7 1 0 0 0 0 0 0 9 2 0 0 0 0 0 0\n";
+        let sum = |spec: &str| {
+            let ifaces = Ifaces::parse(spec).unwrap();
+            parse_net_dev(dev, |n| ifaces.counts(Path::new("/nonexistent"), n))
+        };
+        assert_eq!(sum(""), (1058, 1060), "by default both real ports count the forwarded bytes");
+        assert_eq!(sum("pppoe-wan"), (1000, 52), "a listed interface counts though it is stacked");
+        assert_eq!(sum("vmbr0"), (7, 9));
+        assert_eq!(sum("-eth0"), (1008, 60), "an exclusion comes off the default set");
+        assert_eq!(sum("eth*,-eth0"), (1008, 60), "and off a list, which matches prefixes too");
+        assert_eq!(sum("eth9"), (0, 0), "an absent interface counts nothing rather than everything");
+
+        for bad in ["eth0 eth1", "e*h0", "-", "eth0,-"] {
+            assert!(Ifaces::parse(bad).is_err(), "{bad:?} would silently count nothing");
+        }
+
+        // A different set within one boot must make the hub re-baseline rather
+        // than book the difference between two sums as traffic.
+        let epoch = |spec: &str| Ifaces::parse(spec).unwrap().epoch("boot".into());
+        assert_eq!(epoch(""), "boot", "without --iface the kernel's boot id goes out unchanged");
+        assert_ne!(epoch("eth1"), epoch(""));
+        assert_ne!(epoch("eth1"), epoch("eth0"));
+        assert_eq!(epoch(" eth1 , "), epoch("eth1"), "spacing alone is not a different set");
     }
 
     #[test]
@@ -807,7 +1042,7 @@ mod tests {
 
     #[test]
     fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
-        let mut c = Collector::new();
+        let mut c = Collector::default();
         let t0 = Instant::now();
         assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
         let t1 = t0 + std::time::Duration::from_secs(2);
@@ -871,7 +1106,7 @@ mod tests {
 
     #[test]
     fn real_host_collection_is_sane() {
-        let mut c = Collector::new();
+        let mut c = Collector::default();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
         // Whatever this host reports must parse, and a virtual bridge must not
@@ -883,6 +1118,9 @@ mod tests {
         assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
+        // Read through the real /sys: a link-type test misfiring on this host's
+        // NIC would leave nothing counted.
+        assert!(!c.counted_ifaces().is_empty(), "a reachable host counts at least one interface");
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
@@ -907,7 +1145,7 @@ mod crosscheck {
     /// Values are printed, so `cargo test crosscheck -- --nocapture` shows them.
     #[test]
     fn memory_and_disk_agree_with_free_and_df_on_this_machine() {
-        let mut c = Collector::new();
+        let mut c = Collector::default();
         let m = c.collect();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));

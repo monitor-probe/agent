@@ -39,11 +39,14 @@ monitor-agent --server https://your-hub --token <token>
 
 `src/collect.rs` 中的 `Facts` 与 `Metrics` 两个 struct 直接序列化为线上 JSON，是字段的权威定义。
 
-- **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6
+- **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6（每族一个，公网地址优先；IPv6 不取临时地址和已废弃地址）
 - **`Metrics`** 每 `--interval` 秒上报：CPU、负载、内存、swap、磁盘、网卡收发速率与内核累计计数器、TCP / UDP 连接数、进程数、运行时间
 
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
+
+连接 hub 时逐个尝试解析出的地址，除最后一个外每个限 5 秒。网卡上只有内网 IPv4（NAT）时先连 hub 的
+IPv4：NAT 的公网地址不在网卡上，hub 只有看到一条 IPv4 连接才知道它。
 
 协议说明见 [hub 仓库](https://github.com/monitor-probe/monitor)。
 

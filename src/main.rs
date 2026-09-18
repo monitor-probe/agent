@@ -211,17 +211,30 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
     }
 }
 
-/// Deadline covering all three stages of establishing a connection.
+/// Deadline covering every stage of establishing a connection: resolution,
+/// the TCP handshake, the TLS exchange and the HTTP upgrade.
 ///
 /// Only the TCP handshake has a deadline of its own; the TLS exchange and the
 /// HTTP upgrade have none, so a peer that accepts and then goes silent would
-/// leave `connect_async` pending indefinitely, and the agent running without
+/// leave the handshake pending indefinitely, and the agent running without
 /// reporting or logging.
 ///
 /// Deliberately generous: a healthy connect takes a quarter of a second, the
 /// slowest measured sixty. This is not a latency budget but the point past
 /// which nothing is expected to arrive.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long one of the hub's addresses may take to accept a TCP connection
+/// while another remains to be tried: the first SYN and its retransmits at one
+/// and three seconds. The last address has no limit of its own and is bounded
+/// by [`CONNECT_DEADLINE`] alone, so a hub with a single slow address is
+/// reached as before.
+///
+/// Without it a black-holed address -- typically an AAAA record over a v6
+/// route that leads nowhere -- holds the connect for the kernel's 127 seconds
+/// of SYN retries, beyond CONNECT_DEADLINE, and the address behind it is never
+/// tried.
+const DIAL_FALLBACK: Duration = Duration::from_secs(5);
 
 /// The hub sends one kind of message, a probe list a few hundred bytes long.
 /// Tungstenite's 64 MiB default would hand the peer this process's entire
@@ -253,18 +266,37 @@ async fn session(
         .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-    let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
-    let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, connect)
+    let uri = request.uri();
+    // Brackets off an IPv6 literal, which `lookup_host` parses bare.
+    let host = uri
+        .host()
+        .context("server URL has no host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    // Collected before dialing, as the v4 it reports decides which family is
+    // tried first.
+    let facts = collector.facts();
+    let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
+    let connect = async {
+        let stream = dial(&host, port, behind_nat).await?;
+        let peer = stream.peer_addr()?;
+        let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
+            .await
+            .context("handshake")?;
+        anyhow::Ok((ws, peer))
+    };
+    let (mut ws, peer) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
-        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
-        .context("connect")?;
-    eprintln!("connected");
+        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
+    eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -314,6 +346,47 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+/// Opens the TCP connection to the hub, trying its addresses in turn.
+///
+/// A host whose IPv4 is private tries the hub's IPv4 addresses first. Its
+/// public IPv4 exists only on the NAT in front of it, and the hub, which knows
+/// no more than the address a connection arrives from, learns it only from a
+/// connection made over v4. A public v6 needs no such route: it sits on the
+/// interface and travels in the hello. Every other host keeps the resolver's
+/// order.
+async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await.with_context(|| format!("resolve {host}"))?.collect();
+    if prefer_v4 {
+        addrs.sort_by_key(|a| !a.is_ipv4());
+    }
+    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+}
+
+/// The first of `addrs` to accept, each but the last given [`DIAL_FALLBACK`].
+/// Every failure is kept, so the log names which family failed and how.
+async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+    let mut failures = Vec::new();
+    for (i, addr) in addrs.iter().enumerate() {
+        let attempt = TcpStream::connect(addr);
+        let result = if i + 1 < addrs.len() {
+            tokio::time::timeout(DIAL_FALLBACK, attempt)
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+        } else {
+            attempt.await
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(e) => failures.push(format!("{addr}: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        bail!("no address");
+    }
+    bail!("{}", failures.join("; "))
 }
 
 /// Ceiling on concurrent probe loops.
@@ -547,6 +620,46 @@ mod tests {
             handshake([dead, dead, dead, addr].into_iter()).await,
             -1,
             "a fourth address is not tried"
+        );
+    }
+
+    /// A listener whose accept queue is full drops further SYNs rather than
+    /// refusing them: a black hole on loopback. The clock is paused, so the
+    /// fallback deadline elapses as soon as nothing else can progress, while
+    /// without it the connect would wait out the kernel's SYN retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_black_holed_address_gives_way_to_the_next_within_the_fallback() {
+        let hole = tokio::net::TcpSocket::new_v4().unwrap();
+        hole.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let hole = hole.listen(0).unwrap();
+        let dead = hole.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(dead).unwrap();
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = live.local_addr().unwrap();
+
+        let started = Instant::now();
+        let stream = connect_first(&[dead, live]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        assert_eq!(started.elapsed(), DIAL_FALLBACK, "the dead address costs the fallback and no more");
+        let e = connect_first(&[dead, "127.0.0.1:1".parse().unwrap()]).await.unwrap_err().to_string();
+        assert!(e.contains("timed out") && e.contains("refused"), "each failure is named: {e}");
+    }
+
+    /// `localhost` resolves to ::1 before 127.0.0.1, so only the preference
+    /// can land this connect on v4.
+    #[tokio::test]
+    async fn a_host_behind_nat_dials_the_hubs_v4_first() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let _v6 = std::net::TcpListener::bind(("::1", port)).unwrap();
+        assert!(dial("localhost", port, true).await.unwrap().peer_addr().unwrap().is_ipv4());
+        assert!(
+            dial("localhost", port, false).await.unwrap().peer_addr().unwrap().is_ipv6(),
+            "the premise: the resolver lists ::1 first"
+        );
+        assert!(
+            dial("::1", port, true).await.unwrap().peer_addr().unwrap().is_ipv6(),
+            "a literal is dialed as given"
         );
     }
 

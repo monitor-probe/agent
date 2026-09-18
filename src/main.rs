@@ -645,18 +645,21 @@ mod tests {
         assert!(e.contains("timed out") && e.contains("refused"), "each failure is named: {e}");
     }
 
-    /// `localhost` resolves to ::1 before 127.0.0.1, so only the preference
-    /// can land this connect on v4.
+    /// Where `localhost` resolves to ::1 before 127.0.0.1, only the preference
+    /// can land this connect on v4. Elsewhere -- no v6 loopback, or a resolver
+    /// ordering v4 first -- the preference is not observable and the test says
+    /// so rather than failing.
     #[tokio::test]
     async fn a_host_behind_nat_dials_the_hubs_v4_first() {
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = v4.local_addr().unwrap().port();
-        let _v6 = std::net::TcpListener::bind(("::1", port)).unwrap();
+        let Ok(_v6) = std::net::TcpListener::bind(("::1", port)) else {
+            return eprintln!("skipped: no IPv6 loopback");
+        };
+        if !dial("localhost", port, false).await.unwrap().peer_addr().unwrap().is_ipv6() {
+            return eprintln!("skipped: the resolver lists 127.0.0.1 first");
+        }
         assert!(dial("localhost", port, true).await.unwrap().peer_addr().unwrap().is_ipv4());
-        assert!(
-            dial("localhost", port, false).await.unwrap().peer_addr().unwrap().is_ipv6(),
-            "the premise: the resolver lists ::1 first"
-        );
         assert!(
             dial("::1", port, true).await.unwrap().peer_addr().unwrap().is_ipv6(),
             "a literal is dialed as given"

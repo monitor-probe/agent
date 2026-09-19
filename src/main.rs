@@ -40,9 +40,7 @@ fn usage() -> ! {
            --interval <secs>    Report interval (default 1)\n  \
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
-                                from what would be counted; a trailing *\n                       \
-                                picks by prefix among the interfaces counted\n                       \
-                                by default.\n  \
+                                from what would be counted. Full names only.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",

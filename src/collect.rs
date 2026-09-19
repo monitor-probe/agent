@@ -150,18 +150,17 @@ pub struct Metrics {
     pub procs: u32,
 }
 
-/// The traffic filter set by `--iface`: interface names separated by commas,
-/// each matching a prefix when it ends in `*`.
+/// The traffic filter set by `--iface`: full interface names separated by
+/// commas.
 ///
 /// A plain entry makes the list the whole answer: nothing unlisted is counted.
 /// Only the machine's owner knows which port faces the provider on a router,
 /// where a forwarded byte crosses two real NICs, or whether a Proxmox host's
-/// `vmbr0` alone should count. A full name is counted whatever the built-in
-/// rules say, since that is how `vmbr0` or `pppoe-wan` is chosen; a prefix
-/// picks only among what those rules count, so `enp*` takes the ports and not
-/// their VLAN children. An entry starting with `-` removes its matches from what
-/// is counted otherwise, which one command can apply across machines whose NICs
-/// are named differently. Exclusions win over inclusions.
+/// `vmbr0` alone should count. A listed name is counted whatever the built-in
+/// rules say, since that is how `vmbr0` or `pppoe-wan` is chosen. An entry
+/// starting with `-` removes that interface from what is counted otherwise,
+/// which one batch command can apply across machines whose other NICs are named
+/// differently. Exclusions win over inclusions.
 #[derive(Default)]
 pub struct Ifaces {
     spec: String,
@@ -181,13 +180,15 @@ impl Ifaces {
             // Rejected rather than left to match nothing or everything: each
             // would silently change the totals. install.sh and the panel refuse
             // the same entries.
-            if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
+            // `*` included: a wildcard would match no interface, where the
+            // intent was plainly a set of them.
+            if name.is_empty()
+                || name.starts_with('-')
+                || name.contains(|c: char| c.is_whitespace() || c == '*')
+            {
                 return Err(format!(
-                    "--iface: {entry:?} is not an interface name; separate names with commas"
+                    "--iface: {entry:?} is not an interface name; give full names separated by commas"
                 ));
-            }
-            if name == "*" || name.find('*').is_some_and(|i| i + 1 < name.len()) {
-                return Err(format!("--iface: {entry:?}: `*` may only end a name"));
             }
             list.push(name.to_owned());
         }
@@ -195,18 +196,13 @@ impl Ifaces {
     }
 
     fn counts(&self, sys: &Path, name: &str) -> bool {
-        let by_default = || !skip_iface(name) && !is_stacked(name) && !counted_elsewhere(sys, name);
-        if self.skip.iter().any(|p| p.strip_suffix('*').map_or(name == p, |prefix| name.starts_with(prefix)))
-        {
+        if self.skip.iter().any(|n| n == name) {
             return false;
         }
         if !self.only.is_empty() {
-            return self.only.iter().any(|p| match p.strip_suffix('*') {
-                Some(prefix) => name.starts_with(prefix) && by_default(),
-                None => name == p,
-            });
+            return self.only.iter().any(|n| n == name);
         }
-        by_default()
+        !skip_iface(name) && !is_stacked(name) && !counted_elsewhere(sys, name)
     }
 }
 
@@ -1007,9 +1003,8 @@ mod tests {
     }
 
     /// A router forwards each byte across two real NICs, so only its owner can
-    /// name the one facing the provider. A full name in `--iface` is counted
-    /// whatever the built-in rules say; a prefix picks among what they count;
-    /// `-` entries come off the top of either.
+    /// name the one facing the provider. A name in `--iface` is counted whatever
+    /// the built-in rules say; `-` entries come off the top of either.
     #[test]
     fn iface_names_what_is_counted_over_every_built_in_rule() {
         // 1000 bytes downloaded through the router: in on the WAN port inside
@@ -1026,12 +1021,11 @@ mod tests {
         assert_eq!(with("vmbr0"), (7, 9));
         assert_eq!(with("eth1.7"), (500, 30));
         assert_eq!(with("-eth0"), (1008, 60), "an exclusion comes off the default set");
-        // The VLAN shares the prefix, but its bytes are already on eth1.
-        assert_eq!(with("eth*,-eth0"), (1008, 60), "a prefix picks among what the rules count");
+        assert_eq!(with("eth0,eth1,-eth0"), (1008, 60), "an exclusion wins over a listing");
         assert_eq!(with("eth9"), (0, 0), "an absent interface counts nothing rather than everything");
 
         // Each would count nothing, everything, or not what it says.
-        for bad in ["eth0 eth1", "e*h0", "-", "eth0,-", "*", "-*", "--eth0"] {
+        for bad in ["eth0 eth1", "eth*", "e*h0", "-", "eth0,-", "*", "-*", "--eth0"] {
             assert!(Ifaces::parse(bad).is_err(), "{bad:?} must be refused");
         }
     }

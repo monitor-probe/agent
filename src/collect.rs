@@ -22,13 +22,14 @@ use serde::Serialize;
 /// each, idle, wherever the GRE module is loaded. `lxc` and `cilium` are
 /// Cilium's pod veths and host devices, one veth per pod.
 ///
-/// ponytail: a name list, so a GRE tap or a VPN's tap under a new name will be
-/// missed. No kernel attribute separates one from the veth that is an LXC
-/// guest's only link: both are Ethernet with no device and no DEVTYPE, and a
-/// guest counted as virtual would report no traffic at all. Other tunnels are
-/// recognised by [`counted_elsewhere`] whatever their name; the tunnel entries
-/// here also keep their addresses out of [`addresses`]. `--iface` covers
-/// whatever neither catches.
+/// ponytail: a name list, so a GRE tap, or a tap or veth that is no bridge's
+/// port, under a new name will be missed. Nothing in the kernel separates one
+/// from a container's only link -- an LXC guest's veth, the tap of a rootless
+/// container's pasta network -- and a guest counted as virtual would report no
+/// traffic at all. Bridge ports and other tunnels are recognised by
+/// [`counted_elsewhere`] whatever their name; the tunnel entries here also keep
+/// their addresses out of [`addresses`]. `--iface` covers whatever neither
+/// catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -212,6 +213,14 @@ impl Ifaces {
 /// See [`Metrics::boot_id`]. The names are sorted, since /proc/net/dev lists a
 /// recreated interface in a new position without the set having changed, and
 /// hashed with FNV-1a, whose output no Rust release can alter.
+///
+/// ponytail: every change of the set costs the hub one interval on every
+/// interface, including a freshly created one, whose counter starts at zero and
+/// would have added correctly. Where counted interfaces come and go -- pods under
+/// names no rule knows, pppN on a VPN server -- each event loses one interval.
+/// Per-interface counters in the report, summed by the hub, would remove the
+/// loss; an offset kept here would not, as it dies with the process and takes the
+/// traffic of the downtime with it.
 fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
     let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
@@ -227,7 +236,7 @@ fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
 pub struct Collector {
     ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
-    prev_net: Option<(Instant, u64, u64)>,
+    prev_net: Option<(String, Instant, u64, u64)>,
 }
 
 impl Collector {
@@ -275,14 +284,15 @@ impl Collector {
         let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
         let counted = self.counted(&dev);
         let (rx_total, tx_total) = totals(&counted);
-        let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
+        let boot_id = epoch(
+            &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+            counted.iter().map(|(name, ..)| *name),
+        );
+        let (rx, tx) = self.net_rate(&boot_id, rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id: epoch(
-                &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
-                counted.iter().map(|(name, ..)| *name),
-            ),
+            boot_id,
             iface: self.ifaces.spec.clone(),
             uptime: uptime(),
             cpu: self.cpu_percent(),
@@ -314,9 +324,11 @@ impl Collector {
         pct
     }
 
-    fn net_rate(&mut self, rx: u64, tx: u64, now: Instant) -> (u64, u64) {
+    fn net_rate(&mut self, epoch: &str, rx: u64, tx: u64, now: Instant) -> (u64, u64) {
         let rate = match self.prev_net {
-            Some((t, prx, ptx)) => {
+            // Sums over different interface sets: an interface joining would
+            // read as its lifetime counter crossing the wire in one interval.
+            Some((ref e, t, prx, ptx)) if e == epoch => {
                 let secs = now.saturating_duration_since(t).as_secs_f64();
                 if secs <= 0.0 {
                     (0, 0)
@@ -329,9 +341,9 @@ impl Collector {
                     )
                 }
             }
-            None => (0, 0),
+            _ => (0, 0),
         };
-        self.prev_net = Some((now, rx, tx));
+        self.prev_net = Some((epoch.to_owned(), now, rx, tx));
         rate
     }
 }
@@ -571,6 +583,10 @@ const STACKED_DEVTYPES: &[&str] = &["DEVTYPE=bridge", "DEVTYPE=bond"];
 ///   mesh VPN or a user-named vxlan is caught as surely as `wg0`, since its
 ///   payload leaves again inside a packet the carrier counts. Hardware exempts
 ///   an LTE modem in raw-IP mode, which shares type none with WireGuard.
+/// - no hardware behind it, and a `master`: a VM's tap such as libvirt's
+///   `vnet0`, or a container's veth, as a bridge's port. What the guest sends
+///   out crosses the physical port as well. A container's own only link is no
+///   bridge's port inside the container and stays counted.
 ///
 /// A traffic rule only, like [`is_stacked`]: a tunnel broker's prefix on
 /// `he-ipv6` is this machine's address. Unreadable sysfs leaves the name rules
@@ -596,7 +612,7 @@ fn counted_elsewhere(sys: &Path, name: &str) -> bool {
     if dev.join("device").exists() {
         return false;
     }
-    TUNNEL_TYPES.contains(&read("type").trim()) || devtype(TUNNEL_DEVTYPES)
+    dev.join("master").exists() || TUNNEL_TYPES.contains(&read("type").trim()) || devtype(TUNNEL_DEVTYPES)
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one such as
@@ -933,10 +949,10 @@ mod tests {
     /// kernel: link type, the `device` link of hardware, the `lower_` link of a
     /// stacked device, DEVTYPE in `uevent`. A bridge is known by its DEVTYPE even
     /// after its last port has gone and taken the `lower_` link with it. The
-    /// exempt ones are links a machine
-    /// depends on that resemble a copy: a raw-IP LTE modem shares WireGuard's
-    /// type none, OpenVZ's venet0 has no device, and a macvlan moved into a
-    /// container loses its `lower_` link there.
+    /// exempt ones are links a machine depends on that resemble a copy: a raw-IP
+    /// LTE modem shares WireGuard's type none, OpenVZ's venet0 has no device, a
+    /// macvlan moved into a container loses its `lower_` link there, and a NIC
+    /// in a bridge has a `master` as a VM's tap does.
     #[test]
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
         let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
@@ -955,6 +971,8 @@ mod tests {
             ("venet0", 65535, &[]),
             ("mv0", 1, &[]),
             ("eth0", 1, &["device"]),
+            ("vnet0", 1, &["master"]),
+            ("eno1", 1, &["device", "master"]),
         ] {
             let dir = sys.join(name);
             fs::create_dir_all(&dir).unwrap();
@@ -968,11 +986,11 @@ mod tests {
         }
         // Tunnels by link type and DEVTYPE; a user-named bridge and a DSA
         // switch port by their link to the device beneath; a bridge with no
-        // port left and a bond by DEVTYPE.
-        for name in ["he-ipv6", "nebula1", "gre1", "vx100", "lan", "wan", "lxdbr0", "uplink"] {
+        // port left and a bond by DEVTYPE; a VM's tap by its bridge.
+        for name in ["he-ipv6", "nebula1", "gre1", "vx100", "lan", "wan", "lxdbr0", "uplink", "vnet0"] {
             assert!(counted_elsewhere(&sys, name), "{name}: another interface counts these bytes");
         }
-        for name in ["wwan0", "venet0", "mv0", "eth0", "absent0"] {
+        for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "absent0"] {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
         fs::remove_dir_all(&sys).unwrap();
@@ -1099,12 +1117,17 @@ mod tests {
     fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
         let mut c = Collector::default();
         let t0 = Instant::now();
-        assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
+        assert_eq!(c.net_rate("a", 1000, 2000, t0), (0, 0));
         let t1 = t0 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate(1200, 2400, t1), (100, 200));
+        assert_eq!(c.net_rate("a", 1200, 2400, t1), (100, 200));
         // Counter restarted: no negative value, no spurious spike.
         let t2 = t1 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate(50, 60, t2), (0, 0));
+        assert_eq!(c.net_rate("a", 50, 60, t2), (0, 0));
+        // An interface joined with its lifetime counter: not a burst of traffic.
+        let t3 = t2 + std::time::Duration::from_secs(2);
+        assert_eq!(c.net_rate("b", 9_000_000, 9_000_000, t3), (0, 0));
+        let t4 = t3 + std::time::Duration::from_secs(2);
+        assert_eq!(c.net_rate("b", 9_000_200, 9_000_400, t4), (100, 200));
     }
 
     /// Two independent guards reject a mount: its filesystem type, and whether

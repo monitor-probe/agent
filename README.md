@@ -39,8 +39,9 @@ monitor-agent --server https://your-hub --token <token>
 ### 统计哪些网卡的流量
 
 默认规则是同一份线上的字节只数一次：lo、容器与虚拟机网卡、隧道不计；bond、网桥、VLAN、macvlan
-这类叠在别的网卡上的设备也不计，只计它们底下的那块。除了按名字，还按内核给出的链路类型、`DEVTYPE`
-和 `lower_*` 链接判断，改过名的隧道和网桥同样认得出。PPPoE 只认 OpenWrt 的 `pppoe-wan`：pppd 拨号的
+这类叠在别的网卡上的设备也不计，只计它们底下的那块。除了按名字，还按内核给出的链路类型、`DEVTYPE`、
+`lower_*` 链接和所属网桥判断，改过名的隧道、网桥，以及挂在网桥上的虚拟机 tap（如 libvirt 的 `vnet0`）
+和容器 veth 同样认得出。PPPoE 只认 OpenWrt 的 `pppoe-wan`：pppd 拨号的
 `ppp0` 默认照计，因为 LTE 拨号时它是唯一的链路，用 pppd 拨 PPPoE 的机器要用 `--iface` 指定。
 
 转发流量的机器（软路由、桥接了软路由的宿主机）上，同一个包会经过两块真网卡，哪块面向运营商只有

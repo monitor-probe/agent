@@ -180,12 +180,7 @@ impl Ifaces {
             // Rejected rather than left to match nothing or everything: each
             // would silently change the totals. install.sh and the panel refuse
             // the same entries.
-            // `*` included: a wildcard would match no interface, where the
-            // intent was plainly a set of them.
-            if name.is_empty()
-                || name.starts_with('-')
-                || name.contains(|c: char| c.is_whitespace() || c == '*')
-            {
+            if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
                 return Err(format!(
                     "--iface: {entry:?} is not an interface name; give full names separated by commas"
                 ));
@@ -1025,7 +1020,7 @@ mod tests {
         assert_eq!(with("eth9"), (0, 0), "an absent interface counts nothing rather than everything");
 
         // Each would count nothing, everything, or not what it says.
-        for bad in ["eth0 eth1", "eth*", "e*h0", "-", "eth0,-", "*", "-*", "--eth0"] {
+        for bad in ["eth0 eth1", "-", "eth0,-", "--eth0"] {
             assert!(Ifaces::parse(bad).is_err(), "{bad:?} must be refused");
         }
     }

@@ -236,7 +236,9 @@ fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
 pub struct Collector {
     ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
-    prev_net: Option<(String, Instant, u64, u64)>,
+    /// When the last sample was taken, and each counted interface's counters.
+    prev_net_at: Option<Instant>,
+    prev_net: HashMap<String, (u64, u64)>,
 }
 
 impl Collector {
@@ -288,7 +290,7 @@ impl Collector {
             &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
             counted.iter().map(|(name, ..)| *name),
         );
-        let (rx, tx) = self.net_rate(&boot_id, rx_total, tx_total, Instant::now());
+        let (rx, tx) = self.net_rate(&counted, Instant::now());
         let (tcp, udp) = conn_counts();
 
         Metrics {
@@ -324,26 +326,31 @@ impl Collector {
         pct
     }
 
-    fn net_rate(&mut self, epoch: &str, rx: u64, tx: u64, now: Instant) -> (u64, u64) {
-        let rate = match self.prev_net {
-            // Sums over different interface sets: an interface joining would
-            // read as its lifetime counter crossing the wire in one interval.
-            Some((ref e, t, prx, ptx)) if e == epoch => {
+    /// Per interface, over those in both samples: one joining brings a lifetime
+    /// counter that is not this interval's traffic, and one whose counter
+    /// restarted moved backwards. Either would otherwise read as a burst in the
+    /// history. Kept in memory only; a restarted agent reports no rate once.
+    fn net_rate(&mut self, counted: &[(&str, u64, u64)], now: Instant) -> (u64, u64) {
+        let rate = match self.prev_net_at {
+            Some(t) => {
                 let secs = now.saturating_duration_since(t).as_secs_f64();
+                let (rx, tx) = counted
+                    .iter()
+                    .filter_map(|(name, rx, tx)| {
+                        let (prx, ptx) = self.prev_net.get(*name)?;
+                        Some((rx.saturating_sub(*prx), tx.saturating_sub(*ptx)))
+                    })
+                    .fold((0u64, 0u64), |(a, b), (r, t)| (a.saturating_add(r), b.saturating_add(t)));
                 if secs <= 0.0 {
                     (0, 0)
                 } else {
-                    // A counter that moved backwards means a reboot or a wrap:
-                    // report no rate rather than a spurious spike.
-                    (
-                        (rx.saturating_sub(prx) as f64 / secs) as u64,
-                        (tx.saturating_sub(ptx) as f64 / secs) as u64,
-                    )
+                    ((rx as f64 / secs) as u64, (tx as f64 / secs) as u64)
                 }
             }
-            _ => (0, 0),
+            None => (0, 0),
         };
-        self.prev_net = Some((epoch.to_owned(), now, rx, tx));
+        self.prev_net_at = Some(now);
+        self.prev_net = counted.iter().map(|(n, r, t)| ((*n).to_owned(), (*r, *t))).collect();
         rate
     }
 }
@@ -583,10 +590,11 @@ const STACKED_DEVTYPES: &[&str] = &["DEVTYPE=bridge", "DEVTYPE=bond"];
 ///   mesh VPN or a user-named vxlan is caught as surely as `wg0`, since its
 ///   payload leaves again inside a packet the carrier counts. Hardware exempts
 ///   an LTE modem in raw-IP mode, which shares type none with WireGuard.
-/// - no hardware behind it, and a `master`: a VM's tap such as libvirt's
-///   `vnet0`, or a container's veth, as a bridge's port. What the guest sends
-///   out crosses the physical port as well. A container's own only link is no
-///   bridge's port inside the container and stays counted.
+/// - no hardware behind it, and a bridge's port (`brport/`): a VM's tap such as
+///   libvirt's `vnet0`, or a container's veth. What the guest sends out crosses
+///   the physical port as well. A container's own only link is no bridge's port
+///   inside the container and stays counted, as does a device under another
+///   master -- a VRF, Open vSwitch -- whose uplink may be this very device.
 ///
 /// A traffic rule only, like [`is_stacked`]: a tunnel broker's prefix on
 /// `he-ipv6` is this machine's address. Unreadable sysfs leaves the name rules
@@ -612,7 +620,7 @@ fn counted_elsewhere(sys: &Path, name: &str) -> bool {
     if dev.join("device").exists() {
         return false;
     }
-    dev.join("master").exists() || TUNNEL_TYPES.contains(&read("type").trim()) || devtype(TUNNEL_DEVTYPES)
+    dev.join("brport").exists() || TUNNEL_TYPES.contains(&read("type").trim()) || devtype(TUNNEL_DEVTYPES)
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one such as
@@ -951,8 +959,9 @@ mod tests {
     /// after its last port has gone and taken the `lower_` link with it. The
     /// exempt ones are links a machine depends on that resemble a copy: a raw-IP
     /// LTE modem shares WireGuard's type none, OpenVZ's venet0 has no device, a
-    /// macvlan moved into a container loses its `lower_` link there, and a NIC
-    /// in a bridge has a `master` as a VM's tap does.
+    /// macvlan moved into a container loses its `lower_` link there, a NIC in a
+    /// bridge is a bridge's port as a VM's tap is, and a VRF's member has a
+    /// master but is no bridge's port.
     #[test]
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
         let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
@@ -971,8 +980,9 @@ mod tests {
             ("venet0", 65535, &[]),
             ("mv0", 1, &[]),
             ("eth0", 1, &["device"]),
-            ("vnet0", 1, &["master"]),
-            ("eno1", 1, &["device", "master"]),
+            ("vnet0", 1, &["brport"]),
+            ("eno1", 1, &["device", "brport"]),
+            ("up1", 1, &["master"]),
         ] {
             let dir = sys.join(name);
             fs::create_dir_all(&dir).unwrap();
@@ -990,7 +1000,7 @@ mod tests {
         for name in ["he-ipv6", "nebula1", "gre1", "vx100", "lan", "wan", "lxdbr0", "uplink", "vnet0"] {
             assert!(counted_elsewhere(&sys, name), "{name}: another interface counts these bytes");
         }
-        for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "absent0"] {
+        for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "up1", "absent0"] {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
         fs::remove_dir_all(&sys).unwrap();
@@ -1114,20 +1124,18 @@ mod tests {
     }
 
     #[test]
-    fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
+    fn net_rate_counts_each_interface_against_its_own_last_reading() {
         let mut c = Collector::default();
         let t0 = Instant::now();
-        assert_eq!(c.net_rate("a", 1000, 2000, t0), (0, 0));
-        let t1 = t0 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate("a", 1200, 2400, t1), (100, 200));
+        let at = |secs| t0 + std::time::Duration::from_secs(secs);
+        assert_eq!(c.net_rate(&[("eth0", 1000, 2000)], t0), (0, 0));
+        assert_eq!(c.net_rate(&[("eth0", 1200, 2400)], at(2)), (100, 200));
         // Counter restarted: no negative value, no spurious spike.
-        let t2 = t1 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate("a", 50, 60, t2), (0, 0));
-        // An interface joined with its lifetime counter: not a burst of traffic.
-        let t3 = t2 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate("b", 9_000_000, 9_000_000, t3), (0, 0));
-        let t4 = t3 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate("b", 9_000_200, 9_000_400, t4), (100, 200));
+        assert_eq!(c.net_rate(&[("eth0", 50, 60)], at(4)), (0, 0));
+        // An interface joined with its lifetime counter: not a burst of
+        // traffic, and the others keep their rate.
+        assert_eq!(c.net_rate(&[("eth0", 250, 460), ("eth1", 9_000_000, 9_000_000)], at(6)), (100, 200));
+        assert_eq!(c.net_rate(&[("eth0", 450, 860), ("eth1", 9_000_200, 9_000_400)], at(8)), (200, 400));
     }
 
     /// Two independent guards reject a mount: its filesystem type, and whether

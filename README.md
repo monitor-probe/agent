@@ -6,7 +6,7 @@
 
 ## 特性
 
-- 直接读 `/proc` 与 `statvfs`，不依赖 sysinfo
+- 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
@@ -69,7 +69,7 @@ monitor-agent --server https://your-hub --token <token>
 连接 hub 时逐个尝试解析出的地址，除最后一个外每个限 5 秒。网卡上只有内网 IPv4（NAT）时先连 hub 的
 IPv4：NAT 的公网地址不在网卡上，hub 只有看到一条 IPv4 连接才知道它。
 
-协议说明见 [hub 仓库](https://github.com/monitor-probe/monitor)。
+协议说明见文档站的[架构与协议](https://monitor-document.pages.dev/dev/architecture)。
 
 ## 构建
 

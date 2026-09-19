@@ -41,7 +41,8 @@ fn usage() -> ! {
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
                                 from what would be counted; a trailing *\n                       \
-                                matches a prefix.\n  \
+                                picks by prefix among the interfaces counted\n                       \
+                                by default.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",

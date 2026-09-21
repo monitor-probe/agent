@@ -11,6 +11,7 @@
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
+- 出站可走 HTTP 代理（CONNECT 隧道），只能经代理上网的机器也能上报
 
 ## 安装
 
@@ -35,6 +36,8 @@ monitor-agent --server https://your-hub --token <token>
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
 | `--iface` | 空 | 流量统计的网卡，逗号分隔，也可用 `MONITOR_IFACE`；见下 |
+| `--proxy` | 空 | HTTP 代理地址，如 `http://10.0.0.8:3128`，也可用 `MONITOR_PROXY`；见下 |
+| `--insecure` | 关 | 允许对远端 hub 用明文 `ws://`，token 明文传输，仅用于前面没有 TLS 的 `ip:port` |
 
 ### 统计哪些网卡的流量
 
@@ -55,6 +58,26 @@ monitor-agent --server https://your-hub --token <token>
 启动时打印一行 `counting traffic on: ...`，列出此刻计入的网卡。所计网卡的集合一旦变化（改了 `--iface`、
 网卡增减或被重新归类），上报的 `boot_id` 也跟着变，hub 重新对基线，不会把新旧两组读数之差记成流量。
 
+### 通过 HTTP 代理出站
+
+机器只能经代理上网时用 `--proxy`，agent 向代理发 `CONNECT`，之后所有流量都在这条隧道里：
+
+```bash
+monitor-agent --server https://your-hub --token <token> --proxy http://10.0.0.8:3128
+# 需要认证
+monitor-agent --server https://your-hub --token <token> --proxy http://user:pass@10.0.0.8:3128
+```
+
+- **出站只有一条**：到 hub 的 WebSocket 和 hub 下发的 ping 探测都走代理，配了代理之后 agent 唯一的直连对象就是代理本身
+- TLS 握手在隧道里做，SNI 与证书校验都是对 hub 的，代理只看得到 `CONNECT hub:443` 这一行，看不到 token（用了 `--insecure` 则隧道里没有 TLS，代理和明文路径上的每一跳一样能看到 token）
+- hub 的域名由代理解析，本机没有可用 DNS 也能连上
+- 端口必须写全，`http://10.0.0.8` 会直接报错退出，不会去连 80
+- 只支持 `http://` 的 CONNECT 代理，`https://`（对代理本身也加密）和 `socks5://` 会报错；地址可省略 `http://` 前缀，IPv6 要加方括号：`[fd00::1]:3128`
+- 代理拒绝时原样打出它的状态行（如 `407 Proxy Authentication Required`、`403 Forbidden`），认证没过还是出口策略拦了一眼可辨。不少代理只放行 `CONNECT` 到 443，hub 挂在别的端口要先在代理上开
+- 面板上这台机器的来源地址是代理的出口地址；ping 延迟量的是「本机 → 代理 → 目标」整条路，比直连多一跳，且含代理自己解析域名的时间，和直连节点的读数不可直接横向比较。代理拒绝或目标不通仍记 -1
+
+`MONITOR_PROXY` 留空等同于不配代理，安装脚本可以无条件把这个变量写进 env 文件。
+
 ## 上报字段
 
 `src/collect.rs` 中的 `Facts` 与 `Metrics` 两个 struct 直接序列化为线上 JSON，是字段的权威定义。
@@ -67,7 +90,8 @@ monitor-agent --server https://your-hub --token <token>
 是 hub 判定计数器重新开始的唯一依据，**不要删**。`iface` 回报当前的 `--iface`，供面板显示与预填。
 
 连接 hub 时逐个尝试解析出的地址，除最后一个外每个限 5 秒。网卡上只有内网 IPv4（NAT）时先连 hub 的
-IPv4：NAT 的公网地址不在网卡上，hub 只有看到一条 IPv4 连接才知道它。
+IPv4：NAT 的公网地址不在网卡上，hub 只有看到一条 IPv4 连接才知道它。走代理时这条优先级不适用：
+hub 看到的是代理的地址。
 
 协议说明见文档站的[架构与协议](https://monitor-document.pages.dev/dev/architecture)。
 

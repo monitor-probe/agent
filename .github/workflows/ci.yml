@@ -27,3 +27,17 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+      # This commit's agent against the latest released hub, through the hub
+      # repository's end-to-end script: the reported fields are checked where
+      # the hub and the themes read them, not only where they are serialized.
+      - uses: actions/checkout@v7
+        with:
+          repository: monitor-probe/monitor
+          path: hub
+          sparse-checkout: scripts
+      - run: cargo build
+      - run: |
+          curl -fsSL -o monitor-hub https://github.com/monitor-probe/monitor/releases/latest/download/monitor-hub-x86_64-unknown-linux-musl
+          chmod +x monitor-hub
+      - run: hub/scripts/e2e.sh ./monitor-hub target/debug/monitor-agent

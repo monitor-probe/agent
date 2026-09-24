@@ -495,8 +495,8 @@ fn transient_v6(text: &str) -> Vec<Ipv6Addr> {
 /// themselves), multicast and reserved. On the v6 side only 2000::/3 counts,
 /// which leaves out ULA (fc00::/7), link-local and loopback.
 ///
-/// The hub and its panel apply the same ranges to the addresses this agent
-/// reports; the three lists are to be changed together.
+/// The hub applies the same ranges to the addresses this agent reports; the two
+/// lists are to be changed together.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

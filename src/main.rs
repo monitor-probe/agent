@@ -1,7 +1,9 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod proxy;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -19,12 +21,17 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use collect::Collector;
+use proxy::Proxy;
 
 struct Args {
     server: String,
     token: String,
     interval: u64,
     ifaces: collect::Ifaces,
+    /// Reaches the hub through an HTTP CONNECT tunnel, for a host whose only
+    /// route off its network is a proxy. Shared with the probe tasks, which
+    /// tunnel through the same proxy.
+    proxy: Option<Arc<Proxy>>,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
@@ -41,6 +48,11 @@ fn usage() -> ! {
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
                                 from what would be counted. Full names only.\n  \
+           --proxy <url>        Reach the hub through an HTTP proxy, e.g.\n                       \
+                                http://10.0.0.8:3128 or\n                       \
+                                http://user:pass@10.0.0.8:3128. The port is\n                       \
+                                required. Every outbound connection, probes\n                       \
+                                included, goes through it.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",
@@ -51,6 +63,7 @@ fn usage() -> ! {
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let mut proxy = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -59,6 +72,7 @@ fn parse_args() -> Result<Args> {
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
+            "--proxy" => proxy = Some(value()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -68,7 +82,15 @@ fn parse_args() -> Result<Args> {
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    // An empty value reads as no proxy: the env file an install script writes
+    // carries the variable whether or not the operator filled it in, and an
+    // agent that refuses to start over a blank line helps no one.
+    let proxy = proxy
+        .or_else(|| std::env::var("MONITOR_PROXY").ok())
+        .filter(|spec| !spec.trim().is_empty())
+        .map(|spec| Proxy::parse(&spec).map(Arc::new))
+        .transpose()?;
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, proxy, insecure })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -194,6 +216,12 @@ async fn main() -> Result<()> {
         "counting traffic on: {}",
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
+    // Reported once at startup: every connection then leaves from the proxy's
+    // address rather than this host's -- the address the hub records and the
+    // one a probe target sees -- and the log has to say why.
+    if let Some(proxy) = &args.proxy {
+        eprintln!("reaching the hub and every probe target through proxy {}:{}", proxy.host, proxy.port);
+    }
     let mut wait = 0u64;
 
     loop {
@@ -202,7 +230,9 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        let session =
+            session(&url, &args.token, &mut collector, args.interval, args.proxy.as_ref(), &mut connected);
+        if let Err(e) = session.await {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -227,7 +257,8 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
 }
 
 /// Deadline covering every stage of establishing a connection: resolution,
-/// the TCP handshake, the TLS exchange and the HTTP upgrade.
+/// the TCP handshake, the proxy's CONNECT tunnel where one is configured, the
+/// TLS exchange and the HTTP upgrade.
 ///
 /// Only the TCP handshake has a deadline of its own; the TLS exchange and the
 /// HTTP upgrade have none, so a peer that accepts and then goes silent would
@@ -273,6 +304,7 @@ async fn session(
     token: &str,
     collector: &mut Collector,
     interval: u64,
+    proxy: Option<&Arc<Proxy>>,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
@@ -295,8 +327,24 @@ async fn session(
     let facts = collector.facts();
     let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
     let connect = async {
-        let stream = dial(&host, port, behind_nat).await?;
-        let peer = stream.peer_addr()?;
+        let (stream, peer) = match proxy {
+            // The hub's name is resolved by the proxy, not here, and the v4
+            // preference is dropped with it: what the hub sees is the address
+            // the proxy leaves from, whichever family carried this hop.
+            Some(proxy) => {
+                let stream = dial(&proxy.host, proxy.port, false).await?;
+                let via = stream.peer_addr()?;
+                (proxy.tunnel(stream, &host, port).await?, format!("{host}:{port} via proxy {via}"))
+            }
+            None => {
+                let stream = dial(&host, port, behind_nat).await?;
+                let peer = stream.peer_addr()?;
+                (stream, peer.to_string())
+            }
+        };
+        // The request's URI decides the TLS name, so a tunnelled session
+        // still presents the hub's SNI and validates the hub's certificate;
+        // the proxy is a pipe, not a peer.
         let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
             .await
             .context("handshake")?;
@@ -342,7 +390,7 @@ async fn session(
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx, proxy);
                                 }
                             }
                         }
@@ -420,6 +468,7 @@ fn respawn_ping_tasks(
     running: &mut Vec<(PingTask, tokio::task::JoinHandle<()>)>,
     mut wanted: Vec<PingTask>,
     tx: &mpsc::Sender<Message>,
+    proxy: Option<&Arc<Proxy>>,
 ) {
     if wanted.len() > MAX_PING_TASKS {
         // Silent truncation would leave no record of which probes run.
@@ -438,7 +487,7 @@ fn respawn_ping_tasks(
         if running.iter().any(|(t, _)| t.id == task.id) {
             continue;
         }
-        let (tx, spawned) = (tx.clone(), task.clone());
+        let (tx, spawned, proxy) = (tx.clone(), task.clone(), proxy.cloned());
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(spawned.interval.clamp(5, 3600)));
             // As with the report ticker, missed ticks must not fire back to
@@ -451,7 +500,7 @@ fn respawn_ping_tasks(
             let mut said = false;
             loop {
                 ticker.tick().await;
-                let Some(latency) = tcp_ping(&spawned.target).await else {
+                let Some(latency) = tcp_ping(&spawned.target, proxy.as_deref()).await else {
                     if !std::mem::replace(&mut said, true) {
                         eprintln!(
                             "{}: name resolution runs past {}ms, so these rounds report no sample \
@@ -509,7 +558,10 @@ const MAX_PING_ADDRS: usize = 3;
 /// require either a genuinely overrunning resolver or a test-only deadline
 /// parameter. The assertions below spell `Some(-1)`, so collapsing the two
 /// answers back into one `i32` fails to compile.
-async fn tcp_ping(target: &str) -> Option<i32> {
+async fn tcp_ping(target: &str, proxy: Option<&Proxy>) -> Option<i32> {
+    if let Some(proxy) = proxy {
+        return tunnelled_ping(target, proxy).await;
+    }
     // Bounded by the handshake deadline: a resolution slower than a connect is
     // useless as a latency sample, and `lookup_host` has no deadline of its own
     // -- glibc against a black-holed nameserver takes tens of seconds.
@@ -523,6 +575,52 @@ async fn tcp_ping(target: &str) -> Option<i32> {
     // Only the deadline above is ambiguous.
     let Ok(addresses) = resolved else { return Some(-1) };
     Some(handshake(addresses).await)
+}
+
+/// How long a CONNECT tunnel to a probe target may take.
+///
+/// The kernel's SYN timer, which holds [`HANDSHAKE_DEADLINE`] under a second,
+/// says nothing here: what is being timed is the proxy resolving the target
+/// and connecting to it, one hop further out. At 900ms every target past the
+/// proxy's own neighbourhood would read as down.
+///
+/// Still well inside the five-second floor on a probe's interval, so a
+/// tunnel that is refused cannot hold a probe past its next round.
+const TUNNEL_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Round-trip time of a CONNECT tunnel to `target`, for the host whose only
+/// route out is the proxy.
+///
+/// What this measures is the whole path the probe takes: this host to the
+/// proxy, the proxy's resolution of the target, and the proxy's handshake with
+/// it. That is one hop more than a direct probe reports, and the panel's
+/// numbers for such a node are read against the proxy, not the link. It
+/// remains the only reading available -- a direct probe from a network with no
+/// route out reports every target down, which says nothing about any of them.
+///
+/// -1 keeps its meaning: the target did not answer, the proxy refused it, or
+/// the proxy is unreachable. From this host they are one fact, that the target
+/// cannot be reached.
+async fn tunnelled_ping(target: &str, proxy: &Proxy) -> Option<i32> {
+    // The proxy's address is resolved outside the clock, as a direct probe
+    // resolves its target there: the sample is the path, not this host's
+    // resolver. The target's own name is resolved by the proxy and is part of
+    // what the tunnel costs.
+    let lookup = tokio::net::lookup_host((proxy.host.as_str(), proxy.port));
+    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, lookup).await else {
+        return None;
+    };
+    let Some(address) = resolved.ok().and_then(|mut a| a.next()) else { return Some(-1) };
+
+    let started = std::time::Instant::now();
+    let tunnel = async {
+        let stream = TcpStream::connect(address).await.ok()?;
+        proxy.tunnel_target(stream, target).await.ok()
+    };
+    match tokio::time::timeout(TUNNEL_DEADLINE, tunnel).await {
+        Ok(Some(_)) => Some(started.elapsed().as_millis().min(i32::MAX as u128) as i32),
+        _ => Some(-1),
+    }
 }
 
 /// Round-trip time of the first address that completes a handshake.
@@ -617,12 +715,16 @@ mod tests {
         // A loopback handshake completes within a millisecond, so this reads 0
         // either way; what it pins is the contract that reachable is
         // non-negative and unreachable is -1.
-        assert!(tcp_ping(&addr.to_string()).await.unwrap() >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, Some(-1), "nothing is listening there");
+        assert!(tcp_ping(&addr.to_string(), None).await.unwrap() >= 0);
+        assert_eq!(tcp_ping("127.0.0.1:1", None).await, Some(-1), "nothing is listening there");
         // A failed resolution is an unreachable target, not a missing sample.
         // std rejects this port before the resolver is reached, so the
         // assertion needs no network.
-        assert_eq!(tcp_ping("127.0.0.1:99999").await, Some(-1), "an unresolvable target is unreachable");
+        assert_eq!(
+            tcp_ping("127.0.0.1:99999", None).await,
+            Some(-1),
+            "an unresolvable target is unreachable"
+        );
 
         // First address dead: a dual-stack target on a host whose v6 goes
         // nowhere. The probe advances rather than reporting it unreachable.
@@ -636,6 +738,50 @@ mod tests {
             -1,
             "a fourth address is not tried"
         );
+    }
+
+    /// Where a proxy is configured it is the only route out, so a probe has
+    /// to leave through it. A direct connect from such a host reports every
+    /// target down, which says nothing about any of them.
+    #[tokio::test]
+    async fn a_probe_leaves_through_the_proxy_when_one_is_configured() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Opens a tunnel to one target and refuses the rest, as an egress
+        // policy does.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0u8; 1];
+                        if stream.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let answer: &[u8] = if request.starts_with(b"CONNECT 1.1.1.1:443 ") {
+                        b"HTTP/1.1 200 Connection established\r\n\r\n"
+                    } else {
+                        b"HTTP/1.1 403 Forbidden\r\n\r\n"
+                    };
+                    let _ = stream.write_all(answer).await;
+                    // Held open: the probe times the tunnel, not its teardown.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                });
+            }
+        });
+        let proxy = Proxy::parse(&address.to_string()).unwrap();
+
+        assert!(tcp_ping("1.1.1.1:443", Some(&proxy)).await.unwrap() >= 0, "the tunnel opened");
+        // A target the proxy refuses cannot be reached from this host, which
+        // is what -1 says. It is a reading, not a missing sample.
+        assert_eq!(tcp_ping("10.0.0.9:22", Some(&proxy)).await, Some(-1));
+        // The name is the proxy's to resolve: nothing here looked it up, and
+        // the probe still returned a reading rather than no sample.
+        assert_eq!(tcp_ping("no-such-host.invalid:443", Some(&proxy)).await, Some(-1));
     }
 
     /// A listener whose accept queue is full drops further SYNs rather than
@@ -778,7 +924,7 @@ mod tests {
         let mut running = Vec::new();
         let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
 
-        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
+        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx, None);
         assert_eq!(running.len(), 2);
         let (first, second) = (running[0].1.id(), running[1].1.id());
 
@@ -787,6 +933,7 @@ mod tests {
             &mut running,
             vec![task(1, "a:1", 60), task(2, "c:3", 60), task(3, "d:4", 60)],
             &tx,
+            None,
         );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
@@ -796,14 +943,14 @@ mod tests {
 
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.
-        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
+        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx, None);
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");
 
         // One 64 KiB frame could carry some fifteen hundred of these; the
         // agent enforces its own ceiling rather than trusting the count.
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
-        respawn_ping_tasks(&mut running, flood, &tx);
+        respawn_ping_tasks(&mut running, flood, &tx, None);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
     }
 }

@@ -835,10 +835,11 @@ fn hypervisor() -> Option<&'static str> {
 }
 
 /// An x86 hypervisor names itself in CPUID leaf 0x40000000, behind the
-/// hypervisor bit of leaf 1. Every KVM guest reads `kvm` that way, while its
-/// DMI strings are the provider's to choose -- `KVM`, `QEMU`, `Bochs`,
-/// `Alibaba Cloud ECS` -- and would name one hypervisor several ways. A
-/// hypervisor that clears the bit leaves its guest reported as bare metal.
+/// hypervisor bit of leaf 1. A KVM guest reads `kvm` that way, or Microsoft's
+/// signature if it is offered the Hyper-V interface. Its DMI strings are the
+/// provider's to choose -- `KVM`, `QEMU`, `Bochs`, `Alibaba Cloud ECS` -- and
+/// would name one hypervisor several ways. A hypervisor that clears the bit
+/// leaves its guest reported as bare metal.
 #[cfg(target_arch = "x86_64")]
 fn platform_hypervisor() -> Option<&'static str> {
     use std::arch::x86_64::__cpuid;
@@ -1378,7 +1379,8 @@ mod crosscheck {
 
     /// The virtualization type against `systemd-detect-virt`, which reads the
     /// same CPUID leaf and, as root, the container records this agent reads
-    /// unprivileged. It names three platforms by their vendor instead.
+    /// unprivileged. It names four platforms by their vendor instead; its
+    /// `oracle` is VirtualBox, which would read as Oracle's cloud, a KVM one.
     #[test]
     fn virtualization_agrees_with_systemd_detect_virt() {
         // Its exit status is 1 when the answer is `none`.
@@ -1388,6 +1390,7 @@ mod crosscheck {
         let theirs = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         let theirs = match theirs.as_str() {
             "microsoft" => "hyper-v",
+            "oracle" => "virtualbox",
             "amazon" | "google" => "kvm",
             other => other,
         };

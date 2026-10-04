@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-agent"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "futures-util",

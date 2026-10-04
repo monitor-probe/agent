@@ -98,7 +98,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -117,7 +117,7 @@ pub struct Facts {
     pub ipv6: String,
 }
 
-#[derive(Serialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize)]
 pub struct Metrics {
     /// Names the span over which `net_rx_total` and `net_tx_total` readings
     /// are comparable. The hub only tests it for equality, and a change makes
@@ -139,8 +139,9 @@ pub struct Metrics {
     pub swap_used: u64,
     pub disk_total: u64,
     pub disk_used: u64,
-    /// Kernel lifetime byte counters. The hub accumulates these; the agent
-    /// stores nothing and does not attempt to survive a reboot.
+    /// The counted interfaces' lifetime byte counters, summed. The hub
+    /// accumulates these; the agent stores nothing and does not attempt to
+    /// survive a reboot.
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     pub net_rx: u64,
@@ -320,7 +321,7 @@ impl Collector {
     /// Per interface, over those in both samples: one joining brings a lifetime
     /// counter that is not this interval's traffic, and one whose counter
     /// restarted moved backwards. Either would otherwise read as a burst in the
-    /// history. Kept in memory only; a restarted agent reports no rate once.
+    /// history. Kept in memory only.
     fn net_rate(&mut self, counted: &[(&str, u64, u64)], now: Instant) -> (u64, u64) {
         let rate = match self.prev_net_at {
             Some(t) => {
@@ -346,7 +347,7 @@ impl Collector {
     }
 }
 
-fn read_trim(path: &str) -> Option<String> {
+fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
@@ -644,14 +645,15 @@ fn parse_mounts(text: &str) -> Vec<String> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
     let rows = mount_rows(text);
+    // The table is in mount order and a path resolves to the last mount on it,
+    // which is what statvfs below answers for. An earlier entry for the same
+    // point remains listed but is no longer reachable: under ProtectHome=yes a
+    // host whose /home is its own filesystem has that row sitting beneath a
+    // tmpfs, and counting it would book the tmpfs's size as /home's. Indexed
+    // once, as a Kubernetes node lists several mounts per pod.
+    let top: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, &(_, mount, _))| (mount, i)).collect();
     for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
-        // The table is in mount order and a path resolves to the last mount on
-        // it, which is what statvfs below answers for. An earlier entry for the
-        // same point remains listed but is no longer reachable: under
-        // ProtectHome=yes a host whose /home is its own filesystem has that row
-        // sitting beneath a tmpfs, and counting it would book the tmpfs's size
-        // as /home's.
-        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
+        if top[mount] != i {
             continue;
         }
         if skip_fstype(fstype) {
@@ -951,42 +953,123 @@ fn arm_cpu_name(text: &str) -> Option<String> {
     (!names.is_empty()).then(|| names.join("/"))
 }
 
+/// os-release(5): /etc/os-release where it exists, /usr/lib/os-release
+/// otherwise. A value may be quoted either way.
 fn os_pretty_name() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
         .and_then(|t| {
-            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches(['"', '\'']).to_owned()))
         })
         .unwrap_or_else(|| "Linux".into())
 }
 
+/// The virtualization this system runs under, `none` on bare metal. A
+/// container is named rather than the machine whose kernel it shares.
 fn virtualization() -> String {
-    if fs::metadata("/proc/vz").is_ok() {
-        return "openvz".into();
+    let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    container(Path::new("/"), &mounts)
+        .or_else(|| hypervisor().map(Into::into))
+        .unwrap_or_else(|| "none".into())
+}
+
+/// The container this system is, judged from what an unprivileged process
+/// can read: the agent runs as its own user, to whom PID 1's environment is
+/// closed.
+///
+/// - OpenVZ: /proc/vz without the /proc/bc that only the host has.
+/// - Whatever systemd, as PID 1 in a container, recorded in
+///   /run/systemd/container: `lxc`, `docker`, `podman`, `systemd-nspawn`.
+/// - The files Docker and Podman place in each container.
+/// - LXCFS mounted over /proc, as Proxmox and LXD give their containers. This
+///   covers an LXC guest booted by OpenRC, which records nothing; the host
+///   mounts LXCFS elsewhere.
+fn container(root: &Path, mounts: &str) -> Option<String> {
+    let has = |path: &str| root.join(path).exists();
+    if has("proc/vz") && !has("proc/bc") {
+        return Some("openvz".into());
     }
-    if fs::metadata("/proc/xen").is_ok() {
-        return "xen".into();
+    if let Some(name) = read_trim(root.join("run/systemd/container")).filter(|n| !n.is_empty()) {
+        return Some(name);
     }
-    if fs::metadata("/.dockerenv").is_ok() {
-        return "docker".into();
+    if has(".dockerenv") {
+        return Some("docker".into());
     }
-    if let Some(t) = read_trim("/sys/hypervisor/type") {
-        return t.to_lowercase();
+    if has("run/.containerenv") {
+        return Some("podman".into());
     }
-    for path in ["/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"] {
-        let Some(v) = read_trim(path) else { continue };
-        let l = v.to_lowercase();
-        for k in ["kvm", "vmware", "virtualbox", "qemu", "hyper-v", "xen", "bochs", "amazon", "google"] {
-            if l.contains(k) {
-                return k.into();
-            }
-        }
+    mount_rows(mounts)
+        .iter()
+        .any(|&(_, mount, fstype)| fstype == "fuse.lxcfs" && mount.starts_with("/proc/"))
+        .then(|| "lxc".into())
+}
+
+/// The hypervisor beneath this system, `None` on bare metal. Xen is asked
+/// first: a PV guest has no CPUID signature, and an HVM guest that offers
+/// Windows the Hyper-V interface presents Microsoft's.
+fn hypervisor() -> Option<&'static str> {
+    if Path::new("/proc/xen").exists() || Path::new("/sys/hypervisor/type").exists() {
+        return Some("xen");
     }
-    if fs::read_to_string("/proc/cpuinfo").is_ok_and(|t| t.contains("hypervisor")) {
-        "vm".into()
-    } else {
-        "none".into()
+    platform_hypervisor()
+}
+
+/// An x86 hypervisor names itself in CPUID leaf 0x40000000, behind the
+/// hypervisor bit of leaf 1. A KVM guest reads `kvm` that way, or Microsoft's
+/// signature if it is offered the Hyper-V interface. Its DMI strings are the
+/// provider's to choose -- `KVM`, `QEMU`, `Bochs`, `Alibaba Cloud ECS` -- and
+/// would name one hypervisor several ways. A hypervisor that clears the bit
+/// leaves its guest reported as bare metal.
+#[cfg(target_arch = "x86_64")]
+fn platform_hypervisor() -> Option<&'static str> {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx >> 31 == 0 {
+        return None;
     }
+    let leaf = __cpuid(0x4000_0000);
+    let mut signature = [0; 12];
+    for (bytes, reg) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
+        bytes.copy_from_slice(&reg.to_le_bytes());
+    }
+    Some(match &signature {
+        b"KVMKVMKVM\0\0\0" | b"Linux KVM Hv" => "kvm",
+        b"TCGTCGTCGTCG" => "qemu",
+        b"Microsoft Hv" => "hyper-v",
+        b"VMwareVMware" => "vmware",
+        b"VBoxVBoxVBox" => "virtualbox",
+        b"XenVMMXenVMM" => "xen",
+        b"bhyve bhyve " => "bhyve",
+        _ => "vm",
+    })
+}
+
+/// Without CPUID, QEMU's fw_cfg device marks a QEMU machine whatever its DMI
+/// strings say, and is reported as KVM: no provider runs aarch64 guests on the
+/// emulator alone. Clouds that run no QEMU name themselves in DMI, and each
+/// maps to its hypervisor: Nitro and Compute Engine are KVM, Azure is Hyper-V.
+///
+/// ponytail: a provider's bare-metal instance carries the same DMI vendor and
+/// reads as its hypervisor. Telling the two apart takes the SMBIOS
+/// virtual-machine bit, which only root can read.
+#[cfg(not(target_arch = "x86_64"))]
+fn platform_hypervisor() -> Option<&'static str> {
+    if Path::new("/sys/bus/acpi/devices/QEMU0002:00").exists() {
+        return Some("kvm");
+    }
+    let dmi = ["product_name", "sys_vendor"]
+        .map(|f| read_trim(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase())
+        .join(" ");
+    [
+        ("kvm", "kvm"),
+        ("qemu", "kvm"),
+        ("amazon ec2", "kvm"),
+        ("google", "kvm"),
+        ("microsoft", "hyper-v"),
+        ("vmware", "vmware"),
+    ]
+    .into_iter()
+    .find_map(|(word, name)| dmi.contains(word).then_some(name))
 }
 
 #[cfg(test)]
@@ -1199,6 +1282,36 @@ mod tests {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
         fs::remove_dir_all(&sys).unwrap();
+    }
+
+    /// Each kind of container as an unprivileged process sees it. The host of
+    /// each kind shows part of the same picture -- /proc/vz beside /proc/bc,
+    /// LXCFS mounted outside /proc -- and is no container.
+    #[test]
+    fn a_container_is_named_from_what_an_unprivileged_process_can_read() {
+        let root = std::env::temp_dir().join(format!("monitor-agent-root-{}", std::process::id()));
+        let lxcfs = "lxcfs /proc/meminfo fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        let lxcfs_host = "lxcfs /var/lib/lxcfs fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        for (files, mounts, expected) in [
+            (&["proc/vz"][..], "", Some("openvz")),
+            (&["proc/vz", "proc/bc"], "", None),
+            (&["run/systemd/container=lxc\n"], "", Some("lxc")),
+            (&[".dockerenv"], "", Some("docker")),
+            (&["run/.containerenv"], "", Some("podman")),
+            (&[], lxcfs, Some("lxc")),
+            (&[], lxcfs_host, None),
+            (&[], "", None),
+        ] {
+            // Left behind by a failed run under a reused PID, or by the last case.
+            let _ = fs::remove_dir_all(&root);
+            for file in files {
+                let (path, content) = file.split_once('=').unwrap_or((file, ""));
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), content).unwrap();
+            }
+            assert_eq!(container(&root, mounts).as_deref(), expected, "{files:?} {mounts:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A router forwards each byte across two real NICs, so only its owner can
@@ -1466,6 +1579,27 @@ mod crosscheck {
         let parse = |v: Option<&str>| v.expect("df column").parse::<u64>().expect("a byte count");
         assert_eq!(disk_total, parse(row.next()), "f_blocks is not df's size");
         close(disk_used, parse(row.next()), "disk");
+    }
+
+    /// The virtualization type against `systemd-detect-virt`, which reads the
+    /// same CPUID leaf and, as root, the container records this agent reads
+    /// unprivileged. It names four platforms by their vendor instead; its
+    /// `oracle` is VirtualBox, which would read as Oracle's cloud, a KVM one.
+    #[test]
+    fn virtualization_agrees_with_systemd_detect_virt() {
+        // Its exit status is 1 when the answer is `none`.
+        let out = std::process::Command::new("systemd-detect-virt")
+            .output()
+            .unwrap_or_else(|e| panic!("systemd-detect-virt(1) is what this is checked against: {e}"));
+        let theirs = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let theirs = match theirs.as_str() {
+            "microsoft" => "hyper-v",
+            "oracle" => "virtualbox",
+            "amazon" | "google" => "kvm",
+            other => other,
+        };
+        println!("virt {}", virtualization());
+        assert_eq!(virtualization(), theirs);
     }
 
     /// A missing tool is a failure rather than grounds for passing quietly:

@@ -128,7 +128,7 @@ struct Rpc {
     params: serde_json::Value,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone)]
 struct PingTask {
     id: i64,
     target: String,
@@ -315,7 +315,13 @@ async fn session(
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    // The baseline is taken a second before the first report, which then
+    // measures CPU and network over that second rather than over nothing --
+    // all a freshly started process has -- or over the outage since the
+    // previous session.
+    collector.collect();
+    let mut ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
@@ -503,7 +509,8 @@ const MAX_PING_ADDRS: usize = 3;
 ///
 /// The name is resolved before the clock starts: `TcpStream::connect` on a
 /// hostname resolves first and connects second, which would fold resolver
-/// latency into every sample. glibc caches nothing, so this happens each round.
+/// latency into every sample. musl, which the release binaries link, keeps no
+/// cache, so this happens each round.
 ///
 /// ponytail: the `None` arm has no runtime reproduction; forcing it would
 /// require either a genuinely overrunning resolver or a test-only deadline
@@ -512,7 +519,7 @@ const MAX_PING_ADDRS: usize = 3;
 async fn tcp_ping(target: &str) -> Option<i32> {
     // Bounded by the handshake deadline: a resolution slower than a connect is
     // useless as a latency sample, and `lookup_host` has no deadline of its own
-    // -- glibc against a black-holed nameserver takes tens of seconds.
+    // -- musl waits five seconds on a black-holed nameserver.
     //
     // This does not cancel the underlying `getaddrinfo`, which runs to
     // completion on a blocking thread; it only keeps this probe on cadence.
@@ -530,9 +537,10 @@ async fn tcp_ping(target: &str) -> Option<i32> {
 /// The clock restarts on each address, so a dead one contributes nothing;
 /// summing them would report the accumulated wait as latency.
 ///
-/// Every failure advances to the next address, refusals included. glibc
-/// returns the v6 address first, and on a host whose v6 has no route stopping
-/// there would permanently report a target reachable over v4 as down.
+/// Every failure advances to the next address, refusals included. The
+/// resolver lists v6 first wherever the host has a v6 route, so stopping at
+/// the first failure would report a target reachable over v4 as down for as
+/// long as that route leads nowhere.
 async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32 {
     for address in addresses.take(MAX_PING_ADDRS) {
         let started = std::time::Instant::now();

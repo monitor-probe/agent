@@ -389,41 +389,74 @@ fn glimpse_family(session_v6: bool, ipv4: &str, ipv6: &str) -> Option<bool> {
     held.parse::<std::net::IpAddr>().is_ok_and(|ip| !collect::is_public(ip)).then_some(!session_v6)
 }
 
-/// How long the second connection of [`glimpse`] may take. It tells the hub
-/// something and nothing waits on it, so a path that cannot complete is given up
-/// well before [`CONNECT_DEADLINE`].
+/// How long one attempt of [`glimpse`] may take. The session does not wait on
+/// it, so a path that cannot complete is abandoned well before
+/// [`CONNECT_DEADLINE`].
 const GLIMPSE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Attempts of [`glimpse`], and the wait between them. A session on a NAT66
+/// node can run for weeks, so one lost SYN or failed lookup would leave the hub
+/// without the exit until the next reconnect.
+const GLIMPSE_TRIES: u32 = 3;
+const GLIMPSE_RETRY: Duration = Duration::from_secs(30);
+
+/// How an attempt of [`glimpse`] ended once a connection was possible.
+enum Glimpse {
+    /// The hub took the connection, or has no address in that family.
+    Done,
+    /// The hub answered the handshake with a refusal: an older hub without the
+    /// route (404), or a proxy or firewall in front of it (403). Retrying
+    /// changes nothing.
+    Refused(u16),
+}
+
+/// The hub's echo route, from the session's URL.
+fn echo_url(session: &str) -> Result<String> {
+    let base = session.strip_suffix("/ws").context("server URL is not a session route")?;
+    Ok(format!("{base}/echo"))
+}
 
 /// Connects to the hub's echo route once over one address family, `v6` or v4,
 /// and drops the connection once it is upgraded. The hub learns the address this
 /// host exits at in that family from where the connection came, which an
 /// interface holding only a private address cannot tell it. Nothing is
-/// exchanged. A hub from before the route answers 404, and one without that
-/// address family leaves nothing to connect to; neither is worth more than a
-/// line in the log.
+/// exchanged. Failures are logged and otherwise ignored: the session does not
+/// depend on this one.
 async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) {
-    let attempt = async {
-        let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .with_context(|| format!("resolve {host}"))?
-            .filter(|a| a.is_ipv6() == v6)
-            .collect();
-        if addrs.is_empty() {
-            return Ok(());
-        }
-        let stream = connect_first(&addrs).await?;
-        let echo = format!("{}/echo", url.strip_suffix("/ws").unwrap_or(&url));
-        let request = authorized(&echo, &token)?;
-        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
-            .await
-            .context("handshake")?;
-        anyhow::Ok(())
-    };
     let family = if v6 { "IPv6" } else { "IPv4" };
-    match tokio::time::timeout(GLIMPSE_DEADLINE, attempt).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
-        Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
+    for attempt in 1..=GLIMPSE_TRIES {
+        match tokio::time::timeout(GLIMPSE_DEADLINE, echo_once(&url, &token, &host, port, v6)).await {
+            Ok(Ok(Glimpse::Done)) => return,
+            Ok(Ok(Glimpse::Refused(status))) => {
+                eprintln!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
+                return;
+            }
+            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+            Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
+        }
+        if attempt < GLIMPSE_TRIES {
+            tokio::time::sleep(GLIMPSE_RETRY).await;
+        }
+    }
+}
+
+async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> Result<Glimpse> {
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve {host}"))?
+        .filter(|a| a.is_ipv6() == v6)
+        .collect();
+    if addrs.is_empty() {
+        return Ok(Glimpse::Done);
+    }
+    let stream = connect_first(&addrs).await?;
+    let request = authorized(&echo_url(url)?, token)?;
+    match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
+        Ok(_) => Ok(Glimpse::Done),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Ok(Glimpse::Refused(response.status().as_u16()))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
     }
 }
 
@@ -646,6 +679,13 @@ mod tests {
         assert_eq!(glimpse_family(true, "10.0.0.5", "2001:db8::5"), Some(false));
         assert_eq!(glimpse_family(true, "203.0.113.5", "2001:db8::5"), None);
         assert_eq!(glimpse_family(true, "", "2001:db8::5"), None);
+    }
+
+    #[test]
+    fn the_echo_route_sits_beside_the_session_route() {
+        let session = ws_url("https://hub.example.com/", false).unwrap();
+        assert_eq!(echo_url(&session).unwrap(), "wss://hub.example.com/api/agent/echo");
+        assert!(echo_url("wss://hub.example.com/other").is_err());
     }
 
     #[test]

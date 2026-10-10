@@ -459,12 +459,15 @@ fn addresses() -> (String, String) {
 
 /// Whether an address on this interface may be the machine's own. A skipped
 /// interface lends none: its addresses belong to the containers, guests or
-/// overlay behind it. WireGuard is the exception when the address is public,
-/// since a machine without IPv6 of its own gets a routed prefix through one, and
-/// no overlay or VPN client hands out a global address by accident -- theirs are
-/// private, CGNAT or ULA, which [`is_public`] rejects.
+/// overlay behind it. WireGuard is the exception for a public v6, since a
+/// machine without IPv6 of its own gets a routed prefix through one. VPN
+/// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
+/// rejects. Cloudflare WARP is the one that is not: `wgcf` puts a global
+/// 2606:4700::/32 address on the tunnel, shared by every user of the service
+/// and not reachable from outside, so that range is left out.
 fn lends_address(name: &str, ip: IpAddr) -> bool {
-    !skip_iface(name) || (name.starts_with("wg") && is_public(ip))
+    let routed = |v6: Ipv6Addr| is_public(ip) && v6.segments()[..2] != [0x2606, 0x4700];
+    !skip_iface(name) || (name.starts_with("wg") && matches!(ip, IpAddr::V6(v6) if routed(v6)))
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -1217,8 +1220,9 @@ mod tests {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
-        // Neither this machine's traffic nor its address: container networks,
-        // and tunnels whose payload leaves inside a packet eth0 has counted.
+        // Not this machine's traffic: container networks, and tunnels whose
+        // payload leaves inside a packet eth0 has counted. Their addresses are
+        // lent only as [`lends_address`] allows.
         for name in [
             "lo",
             "docker0",
@@ -1410,14 +1414,25 @@ mod tests {
     }
 
     #[test]
-    fn a_wireguard_link_lends_only_a_public_address() {
+    fn a_wireguard_link_lends_only_a_public_v6() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
         assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
         assert!(!lends_address("wg0", ip("fd00::2")));
+        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1")), "WARP's shared address");
         assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
         assert!(!lends_address("tailscale0", ip("2001:db8::2")));
-        assert!(lends_address("eth0", ip("10.0.0.2")));
+        assert!(lends_address("eth0", ip("2606:4700:110:8a36::1")), "the range is left out only on a tunnel");
+
+        // What `addresses` makes of a machine with a private v4 and a v6 only
+        // through WireGuard.
+        let held: Vec<IpAddr> = [("eth0", "10.0.0.2"), ("wg0", "10.9.0.2"), ("wg0", "2001:db8::2")]
+            .into_iter()
+            .filter(|(n, a)| lends_address(n, ip(a)))
+            .map(|(_, a)| ip(a))
+            .collect();
+        assert_eq!(pick(&held, &[]), ("10.0.0.2".to_owned(), "2001:db8::2".to_owned()));
     }
 
     #[test]

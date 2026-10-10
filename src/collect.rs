@@ -27,9 +27,9 @@ use serde::Serialize;
 /// from a container's only link -- an LXC guest's veth, the tap of a rootless
 /// container's pasta network -- and a guest counted as virtual would report no
 /// traffic at all. Bridge ports and other tunnels are recognised by
-/// [`counted_elsewhere`] whatever their name; the tunnel entries here also keep
-/// their addresses out of [`addresses`]. `--iface` covers whatever neither
-/// catches.
+/// [`counted_elsewhere`] whatever their name; the entries here also keep their
+/// addresses out of [`addresses`], see [`lends_address`]. `--iface` covers
+/// whatever neither catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -442,7 +442,7 @@ fn uptime() -> u64 {
 /// which is what the machine actually holds -- no external service is
 /// consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// Filtered by [`lends_address`], so a docker bridge cannot pass for the
 /// machine's address. [`is_stacked`] is not applied here: it answers whether
 /// bytes were already counted lower down, and a bridge holding the host address
 /// is both stacked and this machine.
@@ -451,10 +451,20 @@ fn addresses() -> (String, String) {
     let held: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| !skip_iface(&i.name) && !i.is_link_local() && i.is_oper_up())
+        .filter(|i| lends_address(&i.name, i.ip()) && !i.is_link_local() && i.is_oper_up())
         .map(|i| i.ip())
         .collect();
     pick(&held, &transient)
+}
+
+/// Whether an address on this interface may be the machine's own. A skipped
+/// interface lends none: its addresses belong to the containers, guests or
+/// overlay behind it. WireGuard is the exception when the address is public,
+/// since a machine without IPv6 of its own gets a routed prefix through one, and
+/// no overlay or VPN client hands out a global address by accident -- theirs are
+/// private, CGNAT or ULA, which [`is_public`] rejects.
+fn lends_address(name: &str, ip: IpAddr) -> bool {
+    !skip_iface(name) || (name.starts_with("wg") && is_public(ip))
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -1397,6 +1407,17 @@ mod tests {
         assert_eq!(picked(&slaac, &transient), pair("", "2409:8a1e:3b41:79f0:211:2233:4455:6677"));
         // A transient address is still better than none.
         assert_eq!(picked(&slaac[..1], &transient), pair("", slaac[0]));
+    }
+
+    #[test]
+    fn a_wireguard_link_lends_only_a_public_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
+        assert!(!lends_address("wg0", ip("fd00::2")));
+        assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
+        assert!(!lends_address("tailscale0", ip("2001:db8::2")));
+        assert!(lends_address("eth0", ip("10.0.0.2")));
     }
 
     #[test]

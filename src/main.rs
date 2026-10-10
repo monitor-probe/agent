@@ -275,10 +275,7 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
-    let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    let request = authorized(url, token)?;
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     let uri = request.uri();
@@ -307,6 +304,9 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
+    if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+        tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+    }
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
@@ -367,6 +367,64 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+/// The upgrade request for `url`, carrying the node's token.
+fn authorized(url: &str, token: &str) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    Ok(request)
+}
+
+/// Which family a second connection is wanted in, as `v6`, given the one the
+/// session runs over and the addresses the interfaces hold. The session shows
+/// the hub one exit; for the other family it is wanted only where the interface
+/// holds a private address of it -- NAT66, a ULA behind a masquerading host --
+/// since a public one is reported as it is and none means nothing to connect
+/// from.
+fn glimpse_family(session_v6: bool, ipv4: &str, ipv6: &str) -> Option<bool> {
+    let held = if session_v6 { ipv4 } else { ipv6 };
+    held.parse::<std::net::IpAddr>().is_ok_and(|ip| !collect::is_public(ip)).then_some(!session_v6)
+}
+
+/// How long the second connection of [`glimpse`] may take. It tells the hub
+/// something and nothing waits on it, so a path that cannot complete is given up
+/// well before [`CONNECT_DEADLINE`].
+const GLIMPSE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Connects to the hub's echo route once over one address family, `v6` or v4,
+/// and drops the connection once it is upgraded. The hub learns the address this
+/// host exits at in that family from where the connection came, which an
+/// interface holding only a private address cannot tell it. Nothing is
+/// exchanged. A hub from before the route answers 404, and one without that
+/// address family leaves nothing to connect to; neither is worth more than a
+/// line in the log.
+async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) {
+    let attempt = async {
+        let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .with_context(|| format!("resolve {host}"))?
+            .filter(|a| a.is_ipv6() == v6)
+            .collect();
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let stream = connect_first(&addrs).await?;
+        let echo = format!("{}/echo", url.strip_suffix("/ws").unwrap_or(&url));
+        let request = authorized(&echo, &token)?;
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
+            .await
+            .context("handshake")?;
+        anyhow::Ok(())
+    };
+    let family = if v6 { "IPv6" } else { "IPv4" };
+    match tokio::time::timeout(GLIMPSE_DEADLINE, attempt).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+        Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
+    }
 }
 
 /// Opens the TCP connection to the hub, trying its addresses in turn.
@@ -574,6 +632,20 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    #[test]
+    fn a_second_connection_is_wanted_only_for_a_private_address_in_the_other_family() {
+        // A v4 session: NAT66 or a ULA is worth asking about, a public v6 is
+        // reported as it is, and none leaves nothing to connect from.
+        assert_eq!(glimpse_family(false, "10.0.0.5", "fd00::5"), Some(true));
+        assert_eq!(glimpse_family(false, "203.0.113.5", "fd42::1"), Some(true));
+        assert_eq!(glimpse_family(false, "10.0.0.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(false, "10.0.0.5", ""), None);
+        // A v6 session reached over a hub that has no v4 record, or whose v4 failed.
+        assert_eq!(glimpse_family(true, "10.0.0.5", "2001:db8::5"), Some(false));
+        assert_eq!(glimpse_family(true, "203.0.113.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(true, "", "2001:db8::5"), None);
     }
 
     #[test]

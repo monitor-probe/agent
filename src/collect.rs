@@ -380,6 +380,9 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     // would understate used memory precisely when it matters.
     let available =
         m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
+    // Above the total, as LXCFS can report it, procps-ng 4 discards the estimate
+    // and `free` shows total - MemFree; subtracting it would report 0.
+    let available = if available > total { g("MemFree") } else { available };
     (total, total.saturating_sub(available))
 }
 
@@ -1120,6 +1123,9 @@ mod tests {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n");
         assert_eq!(mem_used(&m), (1000 * 1024, 400 * 1024));
         assert_eq!(mem_used(&HashMap::new()), (0, 0));
+        // `free` from procps-ng 4.0.4 on this /proc/meminfo shows used 700000.
+        let m = parse_meminfo("MemTotal: 1000000 kB\nMemFree: 300000 kB\nMemAvailable: 1200000 kB\n");
+        assert_eq!(mem_used(&m), (1000000 * 1024, 700000 * 1024));
     }
 
     #[test]

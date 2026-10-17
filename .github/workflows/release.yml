@@ -47,17 +47,37 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      # A manual dispatch builds and collects the binaries; only a tag publishes,
+      # The hub relays these through an operator-configured GitHub proxy and
+      # install.sh executes what arrives, so the hub relays a binary only with a
+      # signature that verifies under the public key built into it. The private
+      # key reaches this job alone. Checked against that same public key here, so
+      # a secret holding any other key fails the release instead of publishing
+      # binaries no hub will relay. Runs on a manual dispatch too.
+      - run: |
+          umask 077
+          printf '%s\n' "$AGENT_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          printf '%s\n' "$PUBLIC_KEY" > "$RUNNER_TEMP/pub.pem"
+          for b in monitor-agent-*-musl; do
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in "$b" -out "$b.sig"
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in "$b" -sigfile "$b.sig"
+          done
+          rm "$RUNNER_TEMP/key.pem"
+        env:
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+          # The hub's `AGENT_SIGNING_KEY` (src/main.rs in the hub repository).
+          PUBLIC_KEY: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAmnxeKfh5WgpyEj7h8GqTQfKVNNvChbmrvuagBtxl7u8=
+            -----END PUBLIC KEY-----
+      # A manual dispatch builds and signs the binaries; only a tag publishes,
       # so the path can be exercised without cutting a release. gh ships on the
       # runner, keeping a third-party action out of the contents:write step.
       # sha256sums.txt is generated from a directory holding only the binaries,
-      # so the names in it are bare. The hub relays these through an
-      # operator-configured GitHub proxy and install.sh executes what arrives,
-      # so a published digest is the only material available to verify them.
+      # so the names in it are bare.
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p bin && mv monitor-agent-* bin/
-          (cd bin && sha256sum monitor-agent-* > sha256sums.txt)
+          (cd bin && sha256sum monitor-agent-*-musl > sha256sums.txt)
           gh release create "$GITHUB_REF_NAME" bin/monitor-agent-* bin/sha256sums.txt \
             --generate-notes --repo "$GITHUB_REPOSITORY"
         env:

@@ -366,7 +366,8 @@ fn parse_meminfo(text: &str) -> HashMap<String, u64> {
         .collect()
 }
 
-/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate.
+/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate, or
+/// minus MemFree where the estimate exceeds the total.
 /// sysinfo's `used_memory()` counts page cache as used and reads gigabytes high
 /// on a host that has been up for a while.
 fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
@@ -381,7 +382,8 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     let available =
         m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
     // Above the total, as LXCFS can report it, procps-ng 4 discards the estimate
-    // and `free` shows total - MemFree; subtracting it would report 0.
+    // and `free` shows total - MemFree; subtracting it would report 0. The
+    // fallback sum is held to the same bound.
     let available = if available > total { g("MemFree") } else { available };
     (total, total.saturating_sub(available))
 }
@@ -1123,6 +1125,10 @@ mod tests {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n");
         assert_eq!(mem_used(&m), (1000 * 1024, 400 * 1024));
         assert_eq!(mem_used(&HashMap::new()), (0, 0));
+    }
+
+    #[test]
+    fn memory_ignores_a_memavailable_above_the_total() {
         // `free` from procps-ng 4.0.4 on this /proc/meminfo shows used 700000.
         let m = parse_meminfo("MemTotal: 1000000 kB\nMemFree: 300000 kB\nMemAvailable: 1200000 kB\n");
         assert_eq!(mem_used(&m), (1000000 * 1024, 700000 * 1024));

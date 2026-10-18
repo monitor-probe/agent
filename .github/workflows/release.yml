@@ -54,14 +54,15 @@ jobs:
       # a secret holding any other key fails the release instead of publishing
       # binaries no hub will relay. Runs on a manual dispatch too.
       - run: |
+          [ -n "$AGENT_SIGNING_KEY" ] || { echo "::error::the AGENT_SIGNING_KEY secret is not set"; exit 1; }
           umask 077
+          trap 'rm -f "$RUNNER_TEMP/key.pem"' EXIT
           printf '%s\n' "$AGENT_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
           printf '%s\n' "$PUBLIC_KEY" > "$RUNNER_TEMP/pub.pem"
           for b in monitor-agent-*-musl; do
             openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in "$b" -out "$b.sig"
             openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in "$b" -sigfile "$b.sig"
           done
-          rm "$RUNNER_TEMP/key.pem"
         env:
           AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
           # The hub's `AGENT_SIGNING_KEY` (src/main.rs in the hub repository).
@@ -72,8 +73,8 @@ jobs:
       # A manual dispatch builds and signs the binaries; only a tag publishes,
       # so the path can be exercised without cutting a release. gh ships on the
       # runner, keeping a third-party action out of the contents:write step.
-      # sha256sums.txt is generated from a directory holding only the binaries,
-      # so the names in it are bare.
+      # sha256sums.txt is generated inside bin/, so the names in it are bare; the
+      # `*-musl` glob keeps the signatures beside the binaries out of it.
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p bin && mv monitor-agent-* bin/

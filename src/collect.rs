@@ -98,7 +98,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -107,9 +107,6 @@ pub struct Facts {
     pub virt: String,
     pub cpu_name: String,
     pub cpu_cores: u32,
-    pub mem_total: u64,
-    pub swap_total: u64,
-    pub disk_total: u64,
     pub agent_version: String,
     /// The host's own addresses, public ones first; see [`pick`]. The hub sees
     /// only the family the agent connected over.
@@ -250,9 +247,7 @@ impl Collector {
 
     pub fn facts(&self) -> Facts {
         let (v4, v6) = addresses();
-        let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -261,9 +256,6 @@ impl Collector {
             virt: virtualization(),
             cpu_name,
             cpu_cores,
-            mem_total: mem.get("MemTotal").copied().unwrap_or(0),
-            swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
-            disk_total,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             ipv4: v4,
             ipv6: v6,
@@ -1548,7 +1540,10 @@ mod tests {
     fn real_host_collection_is_sane() {
         let mut c = Collector::default();
         let f = c.facts();
-        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
+        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1);
+        // A session sends the facts again whenever they differ, so a field that
+        // moves on its own would resend them every minute.
+        assert!(c.facts() == f, "facts collected twice on an idle host differ");
         // Whatever this host reports must parse, and a virtual bridge must not
         // be selected.
         assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());

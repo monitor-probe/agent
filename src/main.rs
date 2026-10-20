@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use collect::Collector;
+use collect::{Collector, Facts};
 
 struct Args {
     server: String,
@@ -267,6 +267,12 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+/// How often a session collects its facts again; a change goes out as another
+/// hello. An address added while connected, or one that arrived after the
+/// boot-time hello, would otherwise wait for the next reconnect, weeks away on
+/// a steady link. The hub drops hellos closer together than half of this.
+const FACTS_RECHECK: Duration = Duration::from_secs(60);
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
@@ -289,7 +295,7 @@ async fn session(
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
     // Collected before dialing, as the v4 it reports decides which family is
     // tried first.
-    let facts = collector.facts();
+    let mut facts = collector.facts();
     let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
     let connect = async {
         let stream = dial(&host, port, behind_nat).await?;
@@ -304,14 +310,17 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
-    if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
-        tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
-    }
+    let glimpse_from = |facts: &Facts| {
+        if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+            tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+        }
+    };
+    glimpse_from(&facts);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(&facts)?), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -323,12 +332,26 @@ async fn session(
     let mut ticker =
         tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+            }
+            _ = recheck.tick() => {
+                let fresh = collector.facts();
+                if fresh == facts {
+                    continue;
+                }
+                if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
+                    glimpse_from(&fresh);
+                }
+                let hello = notify("hello", serde_json::to_value(&fresh)?);
+                if let Err(e) = send(&mut ws, hello, remaining(last_frame)).await { break Err(e); }
+                facts = fresh;
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate

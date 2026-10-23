@@ -185,8 +185,15 @@ async fn main() -> Result<()> {
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
     // filesystem the totals then omit it. The unit file owns that decision, but
     // the discrepancy must not go unreported.
-    for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    let shadowed = collect::shadowed_mounts(&mounts);
+    for mount in &shadowed {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+    }
+    for dir in collect::hidden_dirs(&mounts).into_iter().filter(|d| !shadowed.iter().any(|s| s == d)) {
+        eprintln!(
+            "{dir} is hidden from this service; a disk mounted beneath it is not counted toward disk totals"
+        );
     }
     for (mount, e) in collect::unreadable_mounts() {
         eprintln!("{mount} cannot be read by this user ({e}) and is not counted toward disk totals");

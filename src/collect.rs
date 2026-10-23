@@ -735,6 +735,16 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Of the directories `ProtectHome=yes` replaces with an empty tmpfs, those it
+/// has. A disk mounted beneath one is absent from this mount namespace
+/// altogether, so neither [`shadowed_mounts`] nor [`unreadable_mounts`] can
+/// name it.
+pub fn hidden_dirs(text: &str) -> Vec<&'static str> {
+    let rows = mount_rows(text);
+    let on_top = |dir: &str| rows.iter().rev().find(|(_, m, _)| *m == dir).map(|(_, _, fstype)| *fstype);
+    ["/root", "/home"].into_iter().filter(|dir| on_top(dir) == Some("tmpfs")).collect()
+}
+
 /// Mount points `statvfs` refuses to this user, with the reason, which
 /// [`disk_usage`] skips while `df` as root counts them. Under the `install.sh`
 /// unit the agent runs as its own user with ProtectHome=yes, so a disk mounted
@@ -1582,6 +1592,10 @@ mod tests {
         assert_eq!(shadowed_mounts(table), vec!["/home"]);
         // A point mounted once is not shadowed, however many others exist.
         assert!(shadowed_mounts("/dev/vda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n").is_empty());
+        // What the unit hides: here /home over its own disk, and /root.
+        let hidden = format!("{table}tmpfs /root tmpfs ro,mode=755 0 0\n");
+        assert_eq!(hidden_dirs(&hidden), ["/root", "/home"]);
+        assert!(hidden_dirs("/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\n").is_empty());
     }
 
     #[test]

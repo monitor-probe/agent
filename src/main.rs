@@ -270,7 +270,8 @@ const HUB_SILENCE: Duration = Duration::from_secs(90);
 /// How often a session collects its facts again; a change goes out as another
 /// hello. An address added while connected, or one that arrived after the
 /// boot-time hello, would otherwise wait for the next reconnect, weeks away on
-/// a steady link. The hub drops hellos closer together than half of this.
+/// a steady link. The hub writes at most one hello per half of this and holds
+/// the latest of any that arrive sooner, so none needs sending twice.
 const FACTS_RECHECK: Duration = Duration::from_secs(60);
 
 /// One connection: handshake, then report until the socket closes.
@@ -320,7 +321,11 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(&facts)?), remaining(last_frame)).await?;
+    let mut hello = serde_json::to_value(&facts)?;
+    if let Some(fields) = hello.as_object_mut() {
+        fields.extend(collector.capacities().map(|(k, v)| (k.to_owned(), v.into())));
+    }
+    send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();

@@ -245,6 +245,21 @@ impl Collector {
         net_dev(dev).filter(|(name, ..)| self.ifaces.counts(Path::new(SYS_NET), name)).collect()
     }
 
+    /// Memory, swap and disk totals as a report carries them, for the first
+    /// hello of a session alone. A hub that stores the capacities from the
+    /// hello -- one from 1.3 or earlier never takes them from a report --
+    /// would otherwise record zeros. They stay out of [`Facts`], which a
+    /// session resends whenever it differs, and a total that floats with
+    /// writes, as on ZFS, would resend it every minute.
+    pub fn capacities(&self) -> [(&'static str, u64); 3] {
+        let mem = meminfo();
+        [
+            ("mem_total", mem_used(&mem).0),
+            ("swap_total", swap_used(&mem).0),
+            ("disk_total", disk_usage(&real_mount_points()).0),
+        ]
+    }
+
     pub fn facts(&self) -> Facts {
         let (v4, v6) = addresses();
         let (cpu_name, cpu_cores) = cpuinfo();
@@ -1540,7 +1555,7 @@ mod tests {
     fn real_host_collection_is_sane() {
         let mut c = Collector::default();
         let f = c.facts();
-        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1);
+        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && c.capacities()[0].1 > 0);
         // A session sends the facts again whenever they differ, so a field that
         // moves on its own would resend them every minute.
         assert!(c.facts() == f, "facts collected twice on an idle host differ");

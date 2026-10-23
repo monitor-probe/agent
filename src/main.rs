@@ -83,11 +83,11 @@ fn ws_url(server: &str, insecure: bool) -> Result<String> {
     let scheme = if insecure { "ws" } else { "wss" };
     // Schemes are case-insensitive (RFC 3986), and a phone keyboard capitalises
     // a hand-typed `Https://`; read as a bare host it would never resolve.
-    let given = base.split_once("://").map(|(s, rest)| (s.to_ascii_lowercase(), rest));
-    let base = match given.as_ref().map(|(s, rest)| (s.as_str(), *rest)) {
-        Some(("https", rest)) => format!("wss://{rest}"),
-        Some(("http", rest)) => format!("ws://{rest}"),
-        Some((ws @ ("wss" | "ws"), rest)) => format!("{ws}://{rest}"),
+    let (given, rest) = base.split_once("://").unwrap_or(("", base));
+    let base = match given.to_ascii_lowercase().as_str() {
+        "https" => format!("wss://{rest}"),
+        "http" => format!("ws://{rest}"),
+        ws @ ("wss" | "ws") => format!("{ws}://{rest}"),
         _ => format!("{scheme}://{base}"),
     };
     // RFC 3986 places userinfo before the host, so `127.0.0.1:28080@evil.example.com`
@@ -182,21 +182,25 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
-    // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
-    // filesystem the totals then omit it. The unit file owns that decision, but
-    // the discrepancy must not go unreported.
+    // ProtectHome=yes and a user of its own, which keep some disks out of the
+    // totals. The unit file owns that decision, but the discrepancy must not go
+    // unreported. PID 1's table names every disk the sandbox hides; where /proc
+    // hides PID 1, this namespace's own table still shows a covered /home.
     let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    let shadowed = collect::shadowed_mounts(&mounts);
-    for mount in &shadowed {
-        eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+    match std::fs::read_to_string("/proc/1/mounts") {
+        Ok(host) => {
+            for mount in collect::hidden_mounts(&host, &mounts) {
+                eprintln!("{mount} is not visible to this service and is not counted toward disk totals");
+            }
+        }
+        Err(_) => {
+            for mount in collect::shadowed_mounts(&mounts) {
+                eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+            }
+        }
     }
-    for dir in collect::hidden_dirs(&mounts).into_iter().filter(|d| !shadowed.iter().any(|s| s == d)) {
-        eprintln!(
-            "{dir} is hidden from this service; a disk mounted beneath it is not counted toward disk totals"
-        );
-    }
-    for (mount, e) in collect::unreadable_mounts() {
-        eprintln!("{mount} cannot be read by this user ({e}) and is not counted toward disk totals");
+    for (mount, e) in collect::unreadable_mounts(&mounts) {
+        eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
     }
     let mut collector = Collector::new(args.ifaces);
     // Reported once at startup: an interface summed twice otherwise shows only

@@ -463,7 +463,11 @@ fn addresses() -> (String, String) {
     let held: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| lends_address(&i.name, i.ip()) && !i.is_link_local() && i.is_oper_up())
+        .filter(|i| {
+            lends_address(&i.name, i.ip(), is_tunnel(Path::new(SYS_NET), &i.name))
+                && !i.is_link_local()
+                && i.is_oper_up()
+        })
         .map(|i| i.ip())
         .collect();
     pick(&held, &transient)
@@ -474,12 +478,21 @@ fn addresses() -> (String, String) {
 /// overlay behind it. WireGuard is the exception for a public v6, since a
 /// machine without IPv6 of its own gets a routed prefix through one. VPN
 /// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
-/// rejects. Cloudflare WARP is the one that is not: `wgcf` puts a global
+/// rejects. Cloudflare WARP is the one that is not: it puts a global
 /// 2606:4700::/32 address on the tunnel, shared by every user of the service
-/// and not reachable from outside, so that range is left out.
-fn lends_address(name: &str, ip: IpAddr) -> bool {
-    let routed = |v6: Ipv6Addr| is_public(ip) && v6.segments()[..2] != [0x2606, 0x4700];
-    !skip_iface(name) || (name.starts_with("wg") && matches!(ip, IpAddr::V6(v6) if routed(v6)))
+/// and not reachable from outside, so that range is left out on any tunnel
+/// (`tunnel`: a [`TUNNEL_TYPES`] link), whatever the script setting it up
+/// named the interface -- `wgcf`, `warp`, `CloudflareWARP`.
+fn lends_address(name: &str, ip: IpAddr, tunnel: bool) -> bool {
+    let wg = name.starts_with("wg");
+    if matches!(ip, IpAddr::V6(v6) if v6.segments()[..2] == [0x2606, 0x4700]) && (wg || tunnel) {
+        return false;
+    }
+    !skip_iface(name) || (wg && ip.is_ipv6() && is_public(ip))
+}
+
+fn is_tunnel(sys: &Path, name: &str) -> bool {
+    TUNNEL_TYPES.contains(&fs::read_to_string(sys.join(name).join("type")).unwrap_or_default().trim())
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -719,6 +732,17 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
                     .is_some_and(|(_, _, top)| skip_fstype(top))
         })
         .map(|(_, (_, mount, _))| mount.replace("\\040", " "))
+        .collect()
+}
+
+/// Mount points `statvfs` refuses to this user, with the reason, which
+/// [`disk_usage`] skips while `df` as root counts them. Under the `install.sh`
+/// unit the agent runs as its own user with ProtectHome=yes, so a disk mounted
+/// below /root, /home or a directory closed to other users is one of these.
+pub fn unreadable_mounts() -> Vec<(String, rustix::io::Errno)> {
+    real_mount_points()
+        .into_iter()
+        .filter_map(|m| rustix::fs::statvfs(m.as_str()).err().map(|e| (m, e)))
         .collect()
 }
 
@@ -1435,20 +1459,29 @@ mod tests {
     #[test]
     fn a_wireguard_link_lends_only_a_public_v6() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
-        assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
-        assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
-        assert!(!lends_address("wg0", ip("fd00::2")));
-        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1")), "WARP's shared address");
-        assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
-        assert!(!lends_address("tailscale0", ip("2001:db8::2")));
-        assert!(lends_address("eth0", ip("2606:4700:110:8a36::1")), "the range is left out only on a tunnel");
+        assert!(lends_address("wg0", ip("2001:db8::2"), true), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("203.0.113.9"), true), "only v6 is asked of a tunnel");
+        assert!(!lends_address("wg0", ip("10.0.0.2"), true), "a VPN's own address is not the machine's");
+        assert!(!lends_address("wg0", ip("fd00::2"), true));
+        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1"), true), "WARP's shared address");
+        assert!(
+            !lends_address("docker0", ip("2001:db8::1"), false),
+            "a bridge's prefix belongs to its guests"
+        );
+        assert!(!lends_address("tailscale0", ip("2001:db8::2"), true));
+        assert!(
+            lends_address("eth0", ip("2606:4700:110:8a36::1"), false),
+            "the range is left out only on a tunnel"
+        );
+        for name in ["warp", "CloudflareWARP"] {
+            assert!(!lends_address(name, ip("2606:4700:110:8a36::1"), true), "WARP under the name {name}");
+        }
 
         // What `addresses` makes of a machine with a private v4 and a v6 only
         // through WireGuard.
         let held: Vec<IpAddr> = [("eth0", "10.0.0.2"), ("wg0", "10.9.0.2"), ("wg0", "2001:db8::2")]
             .into_iter()
-            .filter(|(n, a)| lends_address(n, ip(a)))
+            .filter(|(n, a)| lends_address(n, ip(a), n.starts_with("wg")))
             .map(|(_, a)| ip(a))
             .collect();
         assert_eq!(pick(&held, &[]), ("10.0.0.2".to_owned(), "2001:db8::2".to_owned()));
@@ -1574,6 +1607,13 @@ mod tests {
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+        assert!(m.uptime > 0 && m.procs > 1, "uptime {} s, {} processes", m.uptime, m.procs);
+        // A core kept busy between two samples cannot read as idle.
+        let spin = std::time::Instant::now();
+        while spin.elapsed() < std::time::Duration::from_millis(200) {
+            std::hint::black_box(0u64);
+        }
+        assert!(c.collect().cpu > 0.0, "a busy core reads as idle");
     }
 }
 

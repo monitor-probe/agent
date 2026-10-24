@@ -1131,14 +1131,17 @@ fn platform_hypervisor() -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// A path under the temp directory, removed with everything in it when
-    /// dropped, so a failing test leaves nothing behind either. A mutation run
-    /// fails thousands of them.
+    /// A path under the temp directory, cleared of whatever a killed run under
+    /// the same PID left there, and removed with everything in it when dropped,
+    /// so a failing test leaves nothing behind either. A mutation run fails
+    /// thousands of them.
     struct TempDir(std::path::PathBuf);
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            Self(std::env::temp_dir().join(format!("monitor-agent-{name}-{}", std::process::id())))
+            let dir = std::env::temp_dir().join(format!("monitor-agent-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self(dir)
         }
     }
 
@@ -1324,8 +1327,6 @@ mod tests {
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
         let tmp = TempDir::new("sys");
         let sys = tmp.0.clone();
-        // Left behind by a failed run under a reused PID.
-        let _ = fs::remove_dir_all(&sys);
         for (name, ty, extra) in [
             ("he-ipv6", 776, &[][..]),
             ("nebula1", 65534, &[]),
@@ -1383,7 +1384,7 @@ mod tests {
             (&[], lxcfs_host, None),
             (&[], "", None),
         ] {
-            // Left behind by a failed run under a reused PID, or by the last case.
+            // Left behind by the last case.
             let _ = fs::remove_dir_all(&root);
             for file in files {
                 let (path, content) = file.split_once('=').unwrap_or((file, ""));

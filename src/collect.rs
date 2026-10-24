@@ -177,7 +177,7 @@ impl Ifaces {
             };
             // Rejected rather than left to match nothing or everything: each
             // would silently change the totals. install.sh and the panel refuse
-            // the same entries.
+            // these too, and admit only letters, digits, `.`, `_` and `-`.
             if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
                 return Err(format!(
                     "--iface: {entry:?} is not an interface name; give full names separated by commas"
@@ -1406,12 +1406,13 @@ mod tests {
     }
 
     /// The panel's reinstall dialog starts from the filter a node reports, so
-    /// the report carries the one in force, spelled as the panel spells it.
+    /// the report carries the one in force: trimmed, empty entries dropped, in
+    /// the order given. The panel splits it into its two lists, so the order
+    /// carries no meaning.
     #[test]
     fn the_report_names_the_filter_in_force() {
-        let iface = |spec: &str| Collector::new(Ifaces::parse(spec).unwrap()).collect().iface;
-        assert_eq!(iface(" eth1 , -eth0 ,"), "eth1,-eth0");
-        assert_eq!(iface(""), "", "the default rules");
+        let ifaces = Ifaces::parse(" wan , -eth0 , lan ,").unwrap();
+        assert_eq!(Collector::new(ifaces).collect().iface, "wan,-eth0,lan");
     }
 
     /// Any change to which interfaces are summed, within one boot, must make the

@@ -1405,6 +1405,15 @@ mod tests {
         }
     }
 
+    /// The panel's reinstall dialog starts from the filter a node reports, so
+    /// the report carries the one in force, spelled as the panel spells it.
+    #[test]
+    fn the_report_names_the_filter_in_force() {
+        let iface = |spec: &str| Collector::new(Ifaces::parse(spec).unwrap()).collect().iface;
+        assert_eq!(iface(" eth1 , -eth0 ,"), "eth1,-eth0");
+        assert_eq!(iface(""), "", "the default rules");
+    }
+
     /// Any change to which interfaces are summed, within one boot, must make the
     /// hub re-baseline rather than book the difference between two sums: a
     /// device the rules reclassify, a changed `--iface`.

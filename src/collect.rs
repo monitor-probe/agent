@@ -703,6 +703,15 @@ fn real_mounts(text: &str) -> Vec<(String, String)> {
         }
         out.push((key.to_owned(), mount.replace("\\040", " ")));
     }
+    // An overlay root is skipped because its backing disk normally shows up
+    // through another row, as Docker's /etc/hosts bind does. Podman binds those
+    // files from a tmpfs, leaving no row at all, and statvfs on `/` is what df
+    // reports there. Only when nothing else counted: adding `/` beside a row
+    // for the same disk would count it twice.
+    if out.is_empty() && top.get("/").is_some_and(|&i| matches!(rows[i].2, "overlay" | "fuse.fuse-overlayfs"))
+    {
+        out.push(("/".to_owned(), "/".to_owned()));
+    }
     out
 }
 
@@ -1617,6 +1626,21 @@ mod tests {
                    tmpfs /root tmpfs ro 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
         assert_eq!(hidden_mounts(host, own), ["/home", "/home/data"]);
         assert!(hidden_mounts(host, host).is_empty(), "the same namespace hides nothing");
+    }
+
+    #[test]
+    fn an_overlay_root_counts_only_when_nothing_else_does() {
+        for root in ["overlay / overlay rw 0 0", "fuse-overlayfs / fuse.fuse-overlayfs rw 0 0"] {
+            let podman = format!("{root}\ntmpfs /etc/hosts tmpfs rw 0 0\n");
+            assert_eq!(parse_mounts(&podman), ["/"], "{root}");
+        }
+        // Docker binds /etc/hosts from the disk behind the overlay.
+        assert_eq!(
+            parse_mounts("overlay / overlay rw 0 0\n/dev/sda1 /etc/hosts ext4 rw 0 0\n"),
+            ["/etc/hosts"]
+        );
+        // An overlay elsewhere is a container's root seen from its host.
+        assert!(parse_mounts("tmpfs / tmpfs rw 0 0\noverlay /var/lib/x/merged overlay rw 0 0\n").is_empty());
     }
 
     #[test]

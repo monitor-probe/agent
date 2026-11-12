@@ -166,7 +166,15 @@ async fn send(
     tokio::time::timeout(budget, ws.send(m))
         .await
         .map_err(|_| anyhow!("write stalled for {}s", budget.as_secs()))?
+        .map_err(plain)
         .context("write")
+}
+
+/// A WebSocket error as its own message alone. Tungstenite's message already
+/// ends with that of its source, which `{:#}` would print a second time:
+/// `IO error: Connection reset by peer: Connection reset by peer`.
+fn plain(e: WsError) -> anyhow::Error {
+    anyhow!("{e}")
 }
 
 /// Remaining silence budget, measured from the last sign of life.
@@ -320,6 +328,7 @@ async fn session(
         let peer = stream.peer_addr()?;
         let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
             .await
+            .map_err(plain)
             .context("handshake")?;
         anyhow::Ok((ws, peer))
     };
@@ -401,7 +410,7 @@ async fn session(
                     // Ping included: tungstenite queues the pong itself and
                     // sends it on the next read; a manual reply would duplicate it.
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => break Err(e.into()),
+                    Some(Err(e)) => break Err(plain(e)),
                     None => break Ok(()),
                 }
             }
@@ -498,10 +507,8 @@ async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> R
     let request = authorized(&echo_url(url)?, token)?;
     match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
         Ok(_) => Ok(Glimpse::Done),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            Ok(Glimpse::Refused(response.status().as_u16()))
-        }
-        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
+        Err(WsError::Http(response)) => Ok(Glimpse::Refused(response.status().as_u16())),
+        Err(e) => Err(plain(e).context("handshake")),
     }
 }
 
@@ -937,6 +944,17 @@ mod tests {
                 "{spent}s in, the budget must not push the deadline out"
             );
         }
+    }
+
+    #[test]
+    fn a_session_log_line_names_its_cause_once() {
+        let reset = || WsError::Io(std::io::ErrorKind::ConnectionReset.into());
+        let line = format!("{:#}", plain(reset()).context("write"));
+        assert_eq!(line.matches("connection reset").count(), 1, "{line}");
+        // Unconverted, the chain repeats the cause. Should tungstenite stop
+        // folding the source into its message, `plain` is redundant.
+        let chained = format!("{:#}", anyhow::Error::new(reset()));
+        assert_eq!(chained.matches("connection reset").count(), 2, "{chained}");
     }
 
     #[test]

@@ -169,6 +169,24 @@ async fn send(
         .context("write")
 }
 
+/// An error and its causes joined by `: ` as `{:#}` prints them, skipping a
+/// cause whose text the line already ends with. Tungstenite folds its source
+/// into its own message, so `{:#}` alone would print the cause twice:
+/// `IO error: Connection reset by peer (os error 104): Connection reset by peer (os error 104)`.
+fn causes(e: &anyhow::Error) -> String {
+    let mut line = String::new();
+    for cause in e.chain().map(ToString::to_string) {
+        if line.ends_with(&cause) {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str(": ");
+        }
+        line.push_str(&cause);
+    }
+    line
+}
+
 /// Remaining silence budget, measured from the last sign of life.
 ///
 /// Every write draws from this single window, so no sequence of writes can
@@ -220,7 +238,7 @@ async fn main() -> Result<()> {
         // doubling.
         let mut connected = None;
         if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
-            eprintln!("session ended: {e:#}");
+            eprintln!("session ended: {}", causes(&e));
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -325,7 +343,7 @@ async fn session(
     };
     let (mut ws, peer) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
-        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
+        .map_err(|_| anyhow!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
     let glimpse_from = |facts: &Facts| {
@@ -476,7 +494,7 @@ async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) 
                 eprintln!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
                 return;
             }
-            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {}", causes(&e)),
             Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
         }
         if attempt < GLIMPSE_TRIES {
@@ -519,7 +537,8 @@ async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
     if prefer_v4 {
         addrs.sort_by_key(|a| !a.is_ipv4());
     }
-    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+    // Each failure already names its address, the host as resolved.
+    connect_first(&addrs).await.context("connect")
 }
 
 /// The first of `addrs` to accept, each but the last given [`DIAL_FALLBACK`].
@@ -937,6 +956,29 @@ mod tests {
                 "{spent}s in, the budget must not push the deadline out"
             );
         }
+    }
+
+    #[test]
+    fn a_log_line_names_each_cause_once() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+        for e in [
+            WsError::Io(std::io::ErrorKind::ConnectionReset.into()),
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        ] {
+            let e = anyhow::Error::new(e).context("write");
+            let (line, cause) = (causes(&e), e.root_cause().to_string());
+            assert!(line.starts_with("write: "), "{line}");
+            assert_eq!(line.matches(&cause).count(), 1, "{line}");
+        }
+        // A cause the message above it does not repeat stays in the line.
+        assert_eq!(causes(&anyhow!("reset").context("write")), "write: reset");
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_names_the_address_once() {
+        let line = causes(&dial("127.0.0.1", 1, false).await.unwrap_err());
+        assert!(line.starts_with("connect: 127.0.0.1:1: "), "{line}");
+        assert_eq!(line.matches("127.0.0.1").count(), 1, "{line}");
     }
 
     #[test]

@@ -584,7 +584,7 @@ fn is_stacked(name: &str) -> bool {
 
 const SYS_NET: &str = "/sys/class/net";
 
-/// Link types of layer-3 tunnels as /sys/class/net/<name>/type prints them:
+/// Link types of layer-3 tunnels as `/sys/class/net/<name>/type` prints them:
 /// none (tun, WireGuard, Tailscale), ipip, ip6tnl, sit, gre, ip6gre. Read off
 /// devices of each kind created on a 6.1 kernel. OpenVZ's `venet0`, a
 /// container's only link, is void (65535) and stays out.

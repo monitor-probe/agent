@@ -769,6 +769,9 @@ pub fn unreadable_mounts(text: &str) -> Vec<(String, rustix::io::Errno)> {
 /// is what makes that safe: the mounts that hang in D state until a server
 /// answers -- nfs, cifs, ceph, fuse -- never reach this call. Removing an entry
 /// from that list would let a dead NAS freeze the agent, watchdog included.
+/// The one exception is a `fuse.fuse-overlayfs` root that [`real_mounts`]
+/// counts: a stalled daemon blocks this call until it answers again, which
+/// shows the node offline while the container's own filesystem is unusable.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;

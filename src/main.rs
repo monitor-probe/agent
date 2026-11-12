@@ -166,15 +166,25 @@ async fn send(
     tokio::time::timeout(budget, ws.send(m))
         .await
         .map_err(|_| anyhow!("write stalled for {}s", budget.as_secs()))?
-        .map_err(plain)
         .context("write")
 }
 
-/// A WebSocket error as its own message alone. Tungstenite's message already
-/// ends with that of its source, which `{:#}` would print a second time:
-/// `IO error: Connection reset by peer: Connection reset by peer`.
-fn plain(e: WsError) -> anyhow::Error {
-    anyhow!("{e}")
+/// An error and its causes joined by `: ` as `{:#}` prints them, skipping a
+/// cause whose text the line already ends with. Tungstenite folds its source
+/// into its own message, so `{:#}` alone would print the cause twice:
+/// `IO error: Connection reset by peer (os error 104): Connection reset by peer (os error 104)`.
+fn causes(e: &anyhow::Error) -> String {
+    let mut line = String::new();
+    for cause in e.chain().map(ToString::to_string) {
+        if line.ends_with(&cause) {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str(": ");
+        }
+        line.push_str(&cause);
+    }
+    line
 }
 
 /// Remaining silence budget, measured from the last sign of life.
@@ -228,7 +238,7 @@ async fn main() -> Result<()> {
         // doubling.
         let mut connected = None;
         if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
-            eprintln!("session ended: {e:#}");
+            eprintln!("session ended: {}", causes(&e));
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -328,7 +338,6 @@ async fn session(
         let peer = stream.peer_addr()?;
         let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
             .await
-            .map_err(plain)
             .context("handshake")?;
         anyhow::Ok((ws, peer))
     };
@@ -410,7 +419,7 @@ async fn session(
                     // Ping included: tungstenite queues the pong itself and
                     // sends it on the next read; a manual reply would duplicate it.
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => break Err(plain(e)),
+                    Some(Err(e)) => break Err(e.into()),
                     None => break Ok(()),
                 }
             }
@@ -485,7 +494,7 @@ async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) 
                 eprintln!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
                 return;
             }
-            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {}", causes(&e)),
             Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
         }
         if attempt < GLIMPSE_TRIES {
@@ -507,8 +516,10 @@ async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> R
     let request = authorized(&echo_url(url)?, token)?;
     match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
         Ok(_) => Ok(Glimpse::Done),
-        Err(WsError::Http(response)) => Ok(Glimpse::Refused(response.status().as_u16())),
-        Err(e) => Err(plain(e).context("handshake")),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Ok(Glimpse::Refused(response.status().as_u16()))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
     }
 }
 
@@ -947,14 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn a_session_log_line_names_its_cause_once() {
-        let reset = || WsError::Io(std::io::ErrorKind::ConnectionReset.into());
-        let line = format!("{:#}", plain(reset()).context("write"));
-        assert_eq!(line.matches("connection reset").count(), 1, "{line}");
-        // Unconverted, the chain repeats the cause. Should tungstenite stop
-        // folding the source into its message, `plain` is redundant.
-        let chained = format!("{:#}", anyhow::Error::new(reset()));
-        assert_eq!(chained.matches("connection reset").count(), 2, "{chained}");
+    fn a_log_line_names_each_cause_once() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+        for e in [
+            WsError::Io(std::io::ErrorKind::ConnectionReset.into()),
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        ] {
+            let e = anyhow::Error::new(e).context("write");
+            let (line, cause) = (causes(&e), e.root_cause().to_string());
+            assert!(line.starts_with("write: "), "{line}");
+            assert_eq!(line.matches(&cause).count(), 1, "{line}");
+        }
+        // A cause the message above it does not repeat stays in the line.
+        assert_eq!(causes(&anyhow!("reset").context("write")), "write: reset");
     }
 
     #[test]

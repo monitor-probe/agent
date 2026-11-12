@@ -343,7 +343,7 @@ async fn session(
     };
     let (mut ws, peer) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
-        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
+        .map_err(|_| anyhow!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
     let glimpse_from = |facts: &Facts| {
@@ -537,7 +537,8 @@ async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
     if prefer_v4 {
         addrs.sort_by_key(|a| !a.is_ipv4());
     }
-    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+    // Each failure already names its address, the host as resolved.
+    connect_first(&addrs).await.context("connect")
 }
 
 /// The first of `addrs` to accept, each but the last given [`DIAL_FALLBACK`].
@@ -971,6 +972,13 @@ mod tests {
         }
         // A cause the message above it does not repeat stays in the line.
         assert_eq!(causes(&anyhow!("reset").context("write")), "write: reset");
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_names_the_address_once() {
+        let line = causes(&dial("127.0.0.1", 1, false).await.unwrap_err());
+        assert!(line.starts_with("connect: 127.0.0.1:1: "), "{line}");
+        assert_eq!(line.matches("127.0.0.1").count(), 1, "{line}");
     }
 
     #[test]

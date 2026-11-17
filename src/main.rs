@@ -988,6 +988,20 @@ mod tests {
         assert!(!request.uri().to_string().contains("s3cret"));
     }
 
+    /// The hub sends every assigned task in one `ping.tasks` frame. A full list
+    /// of the longest targets a DNS name allows must fit under MAX_MESSAGE, or
+    /// the agent would end the session on that frame and receive it again on
+    /// every reconnect.
+    #[test]
+    fn a_full_task_list_fits_in_one_frame() {
+        let target = format!("{}:65535", "a".repeat(253));
+        let tasks: Vec<_> = (0..MAX_PING_TASKS as i64)
+            .map(|id| serde_json::json!({"id": i64::MAX - id, "target": target, "interval": 3600}))
+            .collect();
+        let frame = notify("ping.tasks", serde_json::json!(tasks));
+        assert!(frame.len() <= MAX_MESSAGE, "{} bytes", frame.len());
+    }
+
     #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
         // The runtime flavour the binary uses.

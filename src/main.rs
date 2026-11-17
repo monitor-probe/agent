@@ -847,6 +847,10 @@ mod tests {
         assert_eq!(started.elapsed(), DIAL_FALLBACK, "the dead address costs the fallback and no more");
         let e = connect_first(&[dead, "127.0.0.1:1".parse().unwrap()]).await.unwrap_err().to_string();
         assert!(e.contains("timed out") && e.contains("refused"), "each failure is named: {e}");
+        // The last address has no fallback of its own: a hub with a single
+        // address keeps the whole CONNECT_DEADLINE for a slow handshake.
+        let alone = tokio::time::timeout(DIAL_FALLBACK * 2, connect_first(&[dead])).await;
+        assert!(alone.is_err(), "the last address must not be cut off at the fallback");
     }
 
     /// Where `localhost` resolves to ::1 before 127.0.0.1, only the preference

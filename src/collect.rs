@@ -463,10 +463,22 @@ fn addresses() -> (String, String) {
     let held: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| lends_address(&i.name, i.ip()) && !i.is_link_local() && i.is_oper_up())
+        .filter(|i| reportable(&i.name, i.ip(), i.is_oper_up()))
         .map(|i| i.ip())
         .collect();
     pick(&held, &transient)
+}
+
+/// Whether an address held by interface `name` may be reported as this
+/// machine's: one the interface lends, not link-local, on an interface that is
+/// up. Link-local addresses sit on every interface that has IPv6; where nothing
+/// public outranks them in [`pick`] they would be reported.
+fn reportable(name: &str, ip: IpAddr, up: bool) -> bool {
+    let link_local = match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    };
+    up && !link_local && lends_address(name, ip)
 }
 
 /// Whether an address on this interface may be the machine's own. A skipped
@@ -1507,6 +1519,23 @@ mod tests {
         assert_eq!(picked(&slaac, &transient), pair("", "2409:8a1e:3b41:79f0:211:2233:4455:6677"));
         // A transient address is still better than none.
         assert_eq!(picked(&slaac[..1], &transient), pair("", slaac[0]));
+    }
+
+    #[test]
+    fn only_an_up_interfaces_own_routable_address_is_reported() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(reportable("eth0", ip("10.0.0.2"), true));
+        assert!(reportable("eth0", ip("2001:db8::2"), true));
+        // On a host with only a private v4 and no global v6, as behind NAT,
+        // nothing public outranks these in `pick`.
+        assert!(!reportable("lo", ip("127.0.0.1"), true), "loopback");
+        assert!(!reportable("lo", ip("::1"), true));
+        assert!(
+            !reportable("eth0", ip("fe80::5054:ff:fe12:3456"), true),
+            "link-local v6 sits on every interface"
+        );
+        assert!(!reportable("eth0", ip("169.254.10.1"), true), "link-local v4");
+        assert!(!reportable("eth1", ip("203.0.113.9"), false), "an interface that is down");
     }
 
     #[test]

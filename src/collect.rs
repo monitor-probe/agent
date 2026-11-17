@@ -657,8 +657,14 @@ fn skip_fstype(fstype: &str) -> bool {
 /// Re-read every sample rather than cached at startup, otherwise a disk attached
 /// later stays invisible until the agent restarts. /proc/self/mounts is a few
 /// kilobytes.
-fn real_mount_points() -> Vec<String> {
-    parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+fn real_mount_points() -> Vec<(String, Option<String>)> {
+    disk_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+}
+
+/// Each counted mount point with the ZFS pool its dataset draws free space
+/// from, which [`disk_usage`] adds once per pool.
+fn disk_mounts(text: &str) -> Vec<(String, Option<String>)> {
+    real_mounts(text).into_iter().map(|(_, mount, pool)| (mount, pool)).collect()
 }
 
 fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
@@ -671,13 +677,13 @@ fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
 }
 
 fn parse_mounts(text: &str) -> Vec<String> {
-    real_mounts(text).into_iter().map(|(_, mount)| mount).collect()
+    real_mounts(text).into_iter().map(|(_, mount, _)| mount).collect()
 }
 
-/// [`parse_mounts`] with the key each point was deduplicated by: the source
-/// device, or a ZFS pool.
-fn real_mounts(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// [`parse_mounts`] with the source each point was deduplicated by and, for a
+/// ZFS dataset, its pool.
+fn real_mounts(text: &str) -> Vec<(String, String, Option<String>)> {
+    let mut out: Vec<(String, String, Option<String>)> = Vec::new();
     let rows = mount_rows(text);
     // The table is in mount order and a path resolves to the last mount on it,
     // which is what statvfs below answers for. An earlier entry for the same
@@ -696,12 +702,15 @@ fn real_mounts(text: &str) -> Vec<(String, String)> {
         if !dev.starts_with('/') && fstype != "zfs" && fstype != "btrfs" {
             continue;
         }
-        // ZFS datasets and btrfs subvolumes share one pool's free space.
-        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev);
-        if out.iter().any(|(k, _)| k == key) {
+        // A btrfs subvolume answers statvfs for the whole filesystem and is
+        // deduplicated by its device like any other. A ZFS dataset answers
+        // only for the bytes it references itself, so every dataset counts,
+        // keyed by its name, and the pool's free space is added once.
+        if out.iter().any(|(k, ..)| k == dev) {
             continue;
         }
-        out.push((key.to_owned(), mount.replace("\\040", " ")));
+        let pool = (fstype == "zfs").then(|| dev.split('/').next().unwrap_or(dev).to_owned());
+        out.push((dev.to_owned(), mount.replace("\\040", " "), pool));
     }
     // An overlay root is skipped because its backing disk normally shows up
     // through another row, as Docker's /etc/hosts bind does. Podman binds those
@@ -710,7 +719,7 @@ fn real_mounts(text: &str) -> Vec<(String, String)> {
     // for the same disk would count it twice.
     if out.is_empty() && top.get("/").is_some_and(|&i| matches!(rows[i].2, "overlay" | "fuse.fuse-overlayfs"))
     {
-        out.push(("/".to_owned(), "/".to_owned()));
+        out.push(("/".to_owned(), "/".to_owned(), None));
     }
     out
 }
@@ -746,8 +755,8 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
 /// by device, so a disk hidden at one point and reachable at another counts as
 /// reachable.
 pub fn hidden_mounts(host: &str, own: &str) -> Vec<String> {
-    let reachable: Vec<String> = real_mounts(own).into_iter().map(|(dev, _)| dev).collect();
-    real_mounts(host).into_iter().filter(|(dev, _)| !reachable.contains(dev)).map(|(_, m)| m).collect()
+    let reachable: Vec<String> = real_mounts(own).into_iter().map(|(dev, ..)| dev).collect();
+    real_mounts(host).into_iter().filter(|(dev, ..)| !reachable.contains(dev)).map(|(_, m, _)| m).collect()
 }
 
 /// Mount points in this namespace that `statvfs` refuses, with the reason,
@@ -772,16 +781,38 @@ pub fn unreadable_mounts(text: &str) -> Vec<(String, rustix::io::Errno)> {
 /// The one exception is a `fuse.fuse-overlayfs` root that [`real_mounts`]
 /// counts: a stalled daemon blocks this call until it answers again, which
 /// shows the node offline while the container's own filesystem is unusable.
-fn disk_usage(mounts: &[String]) -> (u64, u64) {
-    let mut total = 0u64;
-    let mut used = 0u64;
-    for m in mounts {
-        let Ok(s) = rustix::fs::statvfs(m.as_str()) else { continue };
+fn disk_usage(mounts: &[(String, Option<String>)]) -> (u64, u64) {
+    sum_usage(mounts.iter().filter_map(|(path, pool)| {
+        let s = rustix::fs::statvfs(path.as_str()).ok()?;
         let bs = if s.f_frsize > 0 { s.f_frsize } else { s.f_bsize };
-        total = total.saturating_add(s.f_blocks.saturating_mul(bs));
-        used = used.saturating_add(s.f_blocks.saturating_sub(s.f_bfree).saturating_mul(bs));
+        Some((s.f_blocks.saturating_mul(bs), s.f_bfree.saturating_mul(bs), pool.as_deref()))
+    }))
+}
+
+/// Total and used bytes from `(size, free, pool)` readings in bytes.
+///
+/// A ZFS dataset reports as its size the bytes it references plus the pool's
+/// free space, so each dataset contributes only its used bytes and each pool
+/// its free space once. A dataset under a quota sees less free space than its
+/// pool has; the largest any dataset reports is the pool's. Snapshots and
+/// volumes hold space no mounted dataset reports, so a pool holding them reads
+/// low by that much.
+fn sum_usage<'a>(readings: impl Iterator<Item = (u64, u64, Option<&'a str>)>) -> (u64, u64) {
+    let (mut total, mut used) = (0u64, 0u64);
+    let mut pool_free: HashMap<&str, u64> = HashMap::new();
+    for (size, free, pool) in readings {
+        let taken = size.saturating_sub(free);
+        used = used.saturating_add(taken);
+        match pool {
+            Some(pool) => {
+                total = total.saturating_add(taken);
+                let most = pool_free.entry(pool).or_default();
+                *most = (*most).max(free);
+            }
+            None => total = total.saturating_add(size),
+        }
     }
-    (total, used)
+    (pool_free.values().fold(total, |t, free| t.saturating_add(*free)), used)
 }
 
 /// Socket counts from /proc/net/sockstat, a handful of short lines. Counting
@@ -1603,7 +1634,35 @@ mod tests {
         // a fourth: a stacked mount whose source is a directory on the filesystem
         // beneath it, so it passes the device check and carries a source of its
         // own past the dedup, while statvfs reports that filesystem again.
-        assert_eq!(mounts, vec!["/", "/data", "/tank"]);
+        assert_eq!(mounts, vec!["/", "/data", "/tank", "/tank/sub"]);
+        // Each ZFS dataset counts, with its pool, since none reports another's
+        // used space.
+        let pools = disk_mounts(
+            "tank/set1 /tank zfs rw 0 0\ntank/set2 /tank/sub zfs rw 0 0\n/dev/vda1 / ext4 rw 0 0\n",
+        );
+        assert_eq!(pools[1], ("/tank/sub".to_owned(), Some("tank".to_owned())));
+        assert_eq!(pools[2], ("/".to_owned(), None));
+    }
+
+    /// Readings from `df -B1` on an Ubuntu 24.04 VM with one ext4 root and a
+    /// ZFS pool of three datasets holding 300 MiB and 500 MiB. A dataset's size
+    /// is its own referenced bytes plus the pool's free space, so adding the
+    /// sizes would count that free space three times, and taking one dataset
+    /// would drop the others' data.
+    #[test]
+    fn a_zfs_pool_counts_every_dataset_and_its_free_space_once() {
+        let free = 2_625_896_448;
+        let readings = [
+            (11_362_635_776, 9_337_593_856, None),
+            (2_626_027_520, free, Some("tank")),
+            (2_940_731_392, free, Some("tank")),
+            (3_150_577_664, free, Some("tank")),
+            // A dataset under a quota sees less than the pool has free.
+            (1_073_872_896, 1_073_741_824, Some("tank")),
+        ];
+        let (total, used) = sum_usage(readings.into_iter());
+        assert_eq!(used, 2_025_041_920 + 131_072 + 314_834_944 + 524_681_216 + 131_072);
+        assert_eq!(total, 11_362_635_776 + 131_072 + 314_834_944 + 524_681_216 + 131_072 + free);
     }
 
     /// `install.sh` runs this agent with `ProtectHome=yes`, which systemd
@@ -1742,7 +1801,7 @@ mod crosscheck {
         // df(1) counts the root reserve as free, which is f_bfree rather than
         // f_bavail. Compared against a single filesystem, since df is asked
         // about one while the metric sums every mount.
-        let (disk_total, disk_used) = disk_usage(&["/".to_owned()]);
+        let (disk_total, disk_used) = disk_usage(&[("/".to_owned(), None)]);
         let df = tool("df", &["-B1", "--output=size,used", "/"]);
         let mut row = df.lines().nth(1).expect("df prints a data row").split_whitespace();
         let parse = |v: Option<&str>| v.expect("df column").parse::<u64>().expect("a byte count");

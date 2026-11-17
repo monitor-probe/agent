@@ -696,6 +696,13 @@ fn real_mounts(text: &str) -> Vec<(String, String)> {
         if !dev.starts_with('/') && fstype != "zfs" && fstype != "btrfs" {
             continue;
         }
+        // ZFS mounts a snapshot under .zfs/snapshot whenever something reads
+        // it, as `tank/set@daily` or, for the pool's top dataset, `tank@daily`;
+        // the latter would pass for a pool of its own and add the pool's free
+        // space a second time.
+        if fstype == "zfs" && dev.contains('@') {
+            continue;
+        }
         // ZFS datasets and btrfs subvolumes share one pool's free space.
         let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev);
         if out.iter().any(|(k, _)| k == key) {
@@ -1589,7 +1596,9 @@ mod tests {
              /mnt/disk1:/mnt/disk2 /pool fuse.mergerfs rw 0 0\n\
              //nas/backup /mnt/nas cifs rw 0 0\n\
              tank/set1 /tank zfs rw 0 0\n\
-             tank/set2 /tank/sub zfs rw 0 0\n",
+             tank/set2 /tank/sub zfs rw 0 0\n\
+             tank@daily /tank/.zfs/snapshot/daily zfs ro 0 0\n\
+             tank/set2@daily /tank/sub/.zfs/snapshot/daily zfs ro 0 0\n",
         );
         // /snap/... is a real device holding a pseudo filesystem, rejected only
         // by the fstype list; one squashfs per snap would otherwise add a full
@@ -1602,7 +1611,9 @@ mod tests {
         // fuse driver mounts as `fuseblk` and still counts. The ecryptfs row is
         // a fourth: a stacked mount whose source is a directory on the filesystem
         // beneath it, so it passes the device check and carries a source of its
-        // own past the dedup, while statvfs reports that filesystem again.
+        // own past the dedup, while statvfs reports that filesystem again. The
+        // last two are ZFS snapshots mounted on access: one named after the
+        // pool's top dataset would otherwise count as a second pool.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 

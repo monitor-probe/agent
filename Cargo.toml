@@ -27,6 +27,15 @@ if-addrs = "0.15.0"
 # minutes. dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util"] }
 
+# On top of clippy's defaults, which CI runs with -D warnings. Tests may still
+# unwrap (clippy.toml).
+[lints.clippy]
+# The release build aborts on panic, so a failed unwrap takes the whole agent
+# down until systemd restarts it: use ?, or expect("why this cannot fail").
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
 [profile.release]
 codegen-units = 1
 lto = true

@@ -138,10 +138,52 @@ struct PingTask {
     interval: u64,
 }
 
+/// A frame in the shape of a JSON-RPC notification, without the `"jsonrpc"`
+/// member: no hub has ever read it, and it is 16 bytes of every report.
 fn notify(method: &str, params: serde_json::Value) -> Message {
-    Message::Text(
-        serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
-    )
+    Message::Text(serde_json::json!({"method": method, "params": params}).to_string().into())
+}
+
+#[derive(Deserialize)]
+struct Capabilities {
+    #[serde(default)]
+    sticky: Vec<String>,
+}
+
+/// The report fields the hub has declared it fills in while unchanged, and the
+/// value of each as this connection last sent it. A hub that declares none, as
+/// every hub before the declaration existed, receives whole reports. Held for
+/// one connection only: the next starts from whole reports again.
+#[derive(Default)]
+struct Sticky {
+    keys: Vec<String>,
+    sent: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Sticky {
+    /// Each field is decided once per report: named twice, a changed value
+    /// would be recorded on the first pass and dropped as unchanged on the
+    /// second, and the hub would keep the old one.
+    fn new(mut keys: Vec<String>) -> Self {
+        keys.sort();
+        keys.dedup();
+        Sticky { keys, ..Sticky::default() }
+    }
+
+    fn omit_unchanged(&mut self, report: &mut serde_json::Value) {
+        let Some(fields) = report.as_object_mut() else { return };
+        for key in &self.keys {
+            match fields.get(key) {
+                Some(value) if self.sent.get(key) == Some(value) => {
+                    fields.remove(key);
+                }
+                Some(value) => {
+                    self.sent.insert(key.clone(), value.clone());
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 /// Writes under a deadline drawn from the remaining silence budget.
@@ -364,6 +406,7 @@ async fn session(
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut sticky = Sticky::default();
     // The baseline is taken a second before the first report, which then
     // measures CPU and network over that second rather than over nothing --
     // all a freshly started process has -- or over the outage since the
@@ -378,7 +421,8 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
+                let mut m = serde_json::to_value(collector.collect())?;
+                sticky.omit_unchanged(&mut m);
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
             }
             _ = recheck.tick() => {
@@ -412,6 +456,10 @@ async fn session(
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                }
+                            } else if rpc.method == "capabilities" {
+                                if let Ok(caps) = serde_json::from_value::<Capabilities>(rpc.params) {
+                                    sticky = Sticky::new(caps.sticky);
                                 }
                             }
                         }
@@ -1046,5 +1094,31 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+
+    #[test]
+    fn a_report_leaves_out_only_what_the_hub_fills_and_this_connection_sent() {
+        let report = |disk: u64| serde_json::json!({"boot_id": "b", "disk_total": disk, "cpu": 1.0});
+        let mut old_hub = Sticky::default();
+        let mut m = report(5);
+        old_hub.omit_unchanged(&mut m);
+        old_hub.omit_unchanged(&mut m);
+        assert_eq!(m, report(5), "a hub that declared nothing gets every field");
+
+        let mut sticky = Sticky { keys: vec!["boot_id".into(), "disk_total".into()], ..Sticky::default() };
+        let mut first = report(5);
+        sticky.omit_unchanged(&mut first);
+        assert_eq!(first, report(5), "the first report of a connection is whole");
+        let mut same = report(5);
+        sticky.omit_unchanged(&mut same);
+        assert_eq!(same, serde_json::json!({"cpu": 1.0}));
+        let mut resized = report(6);
+        sticky.omit_unchanged(&mut resized);
+        assert_eq!(resized, serde_json::json!({"disk_total": 6, "cpu": 1.0}));
+
+        let mut twice = Sticky::new(vec!["disk_total".into(), "disk_total".into()]);
+        let mut first = report(5);
+        twice.omit_unchanged(&mut first);
+        assert_eq!(first, report(5), "a field named twice still goes out when it is new");
     }
 }

@@ -128,7 +128,9 @@ pub struct Metrics {
     /// by the panel, which reinstalls with it.
     pub iface: String,
     pub uptime: u64,
+    #[serde(serialize_with = "hundredths")]
     pub cpu: f32,
+    #[serde(serialize_with = "hundredths_each")]
     pub load: [f32; 3],
     pub mem_total: u64,
     pub mem_used: u64,
@@ -146,6 +148,22 @@ pub struct Metrics {
     pub tcp: u32,
     pub udp: u32,
     pub procs: u32,
+}
+
+/// Two decimal places on the wire: what the themes show for the load averages,
+/// one more than they show for CPU. Unrounded, an `f32` widened to `f64` prints
+/// as `0.15000000596046448`: the CPU figure and the three load averages would
+/// take 93 bytes of a 471-byte report.
+fn hundredths<S: serde::Serializer>(value: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(round2(*value))
+}
+
+fn hundredths_each<S: serde::Serializer>(values: &[f32; 3], s: S) -> Result<S::Ok, S::Error> {
+    values.map(round2).serialize(s)
+}
+
+fn round2(value: f32) -> f64 {
+    (f64::from(value) * 100.0).round() / 100.0
 }
 
 /// The traffic filter set by `--iface`: full interface names separated by
@@ -1161,6 +1179,33 @@ fn platform_hypervisor() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn figures_with_a_fraction_go_out_at_two_places() {
+        let m = Metrics {
+            boot_id: String::new(),
+            iface: String::new(),
+            uptime: 0,
+            cpu: 1.995,
+            load: [0.15, 0.12, 7.0],
+            mem_total: 0,
+            mem_used: 0,
+            swap_total: 0,
+            swap_used: 0,
+            disk_total: 0,
+            disk_used: 0,
+            net_rx_total: 0,
+            net_tx_total: 0,
+            net_rx: 0,
+            net_tx: 0,
+            tcp: 0,
+            udp: 0,
+            procs: 0,
+        };
+        let text = serde_json::to_value(&m).unwrap().to_string();
+        assert!(text.contains(r#""cpu":2.0,"#), "{text}");
+        assert!(text.contains(r#""load":[0.15,0.12,7.0]"#), "{text}");
+    }
 
     /// A path under the temp directory, cleared of whatever a killed run under
     /// the same PID left there, and removed with everything in it when dropped,

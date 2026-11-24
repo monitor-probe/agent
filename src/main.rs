@@ -161,6 +161,15 @@ struct Sticky {
 }
 
 impl Sticky {
+    /// Each field is decided once per report: named twice, a changed value
+    /// would be recorded on the first pass and dropped as unchanged on the
+    /// second, and the hub would keep the old one.
+    fn new(mut keys: Vec<String>) -> Self {
+        keys.sort();
+        keys.dedup();
+        Sticky { keys, ..Sticky::default() }
+    }
+
     fn omit_unchanged(&mut self, report: &mut serde_json::Value) {
         let Some(fields) = report.as_object_mut() else { return };
         for key in &self.keys {
@@ -450,7 +459,7 @@ async fn session(
                                 }
                             } else if rpc.method == "capabilities" {
                                 if let Ok(caps) = serde_json::from_value::<Capabilities>(rpc.params) {
-                                    sticky = Sticky { keys: caps.sticky, ..Sticky::default() };
+                                    sticky = Sticky::new(caps.sticky);
                                 }
                             }
                         }
@@ -1106,5 +1115,10 @@ mod tests {
         let mut resized = report(6);
         sticky.omit_unchanged(&mut resized);
         assert_eq!(resized, serde_json::json!({"disk_total": 6, "cpu": 1.0}));
+
+        let mut twice = Sticky::new(vec!["disk_total".into(), "disk_total".into()]);
+        let mut first = report(5);
+        twice.omit_unchanged(&mut first);
+        assert_eq!(first, report(5), "a field named twice still goes out when it is new");
     }
 }

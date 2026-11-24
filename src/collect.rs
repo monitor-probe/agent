@@ -150,9 +150,10 @@ pub struct Metrics {
     pub procs: u32,
 }
 
-/// Two decimal places on the wire, one more than the panel shows. Unrounded, an
-/// `f32` widened to `f64` prints as `0.15000000596046448`: the CPU figure
-/// and the three load averages would take 93 bytes of a 471-byte report.
+/// Two decimal places on the wire: what the themes show for the load averages,
+/// one more than they show for CPU. Unrounded, an `f32` widened to `f64` prints
+/// as `0.15000000596046448`: the CPU figure and the three load averages would
+/// take 93 bytes of a 471-byte report.
 fn hundredths<S: serde::Serializer>(value: &f32, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_f64(round2(*value))
 }
